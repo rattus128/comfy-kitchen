@@ -2105,7 +2105,6 @@ extern "C" {
     bool launch_w4a8_codebook_mma(
         const void* xq,
         const void* weight,
-        const void* s_rel,
         const void* decode_lut,
         const void* s_channel,
         const void* xs,
@@ -3115,7 +3114,6 @@ bool w4a8_codebook_gemm_chunked(
 bool w4a8_codebook_mma(
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,
     nb::ndarray<int8_t, nb::ndim<1>, nb::device::cuda> weight,
-    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> decode_lut,
     nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel,
     nb::ndarray<float, nb::ndim<1>, nb::device::cuda> xs,
@@ -3128,10 +3126,9 @@ bool w4a8_codebook_mma(
     const int64_t K = xq.shape(1);
     const int64_t N = s_channel.size();
     const int64_t padded_N = (N + 15) / 16 * 16;
-    if (M > 8 || weight.size() != padded_N * K / 2 || K % G != 0)
+    if (M > 8 || weight.size() != padded_N * K * 9 / 16 || K % G != 0)
         throw std::runtime_error("w4a8_codebook_mma shape mismatch or M > 8");
-    if (s_rel.shape(0) != N || s_rel.shape(1) != K / G
-            || s_channel.size() != N || xs.size() != M)
+    if (s_channel.size() != N || xs.size() != M)
         throw std::runtime_error("w4a8_codebook_mma scale shape mismatch");
     if (decode_lut.shape(0) != 256 || decode_lut.shape(1) != 16
             || decode_lut.stride(1) != 1 || decode_lut.stride(0) != 16)
@@ -3143,13 +3140,12 @@ bool w4a8_codebook_mma(
         throw std::runtime_error("w4a8_codebook_mma workspace, output, or bias mismatch");
     if (xq.stride(1) != 1 || xq.stride(0) != K
             || weight.stride(0) != 1
-            || s_rel.stride(1) != 1 || s_rel.stride(0) != s_rel.shape(1)
             || s_channel.stride(0) != 1 || xs.stride(0) != 1
             || workspace.stride(1) != 1 || workspace.stride(0) != N
             || out.stride(1) != 1 || out.stride(0) != N)
         throw std::runtime_error("w4a8_codebook_mma requires contiguous tensors");
     return launch_w4a8_codebook_mma(
-        xq.data(), weight.data(), s_rel.data(), decode_lut.data(),
+        xq.data(), weight.data(), decode_lut.data(),
         s_channel.data(), xs.data(), bias.has_value() ? bias->data() : nullptr,
         workspace.data(), out.data(), M, N, K, G, split_k, warps_per_block,
         out_dtype_code,
@@ -4133,7 +4129,7 @@ NB_MODULE(_C, m) {
 
     m.def("w4a8_codebook_mma", &w4a8_codebook_mma,
           "Direct packed W4A8 tensor-core MMA for M <= 8 without an INT8 weight workspace",
-          nb::arg("xq"), nb::arg("weight"), nb::arg("s_rel"), nb::arg("decode_lut"),
+          nb::arg("xq"), nb::arg("weight"), nb::arg("decode_lut"),
           nb::arg("s_channel"), nb::arg("xs"), nb::arg("bias").none(),
           nb::arg("workspace"), nb::arg("out"), nb::arg("g"), nb::arg("split_k"),
           nb::arg("warps_per_block"), nb::arg("out_dtype_code"), nb::arg("stream_ptr"));

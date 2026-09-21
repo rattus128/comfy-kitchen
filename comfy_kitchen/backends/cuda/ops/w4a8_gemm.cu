@@ -142,7 +142,6 @@ template <int WarpsPerBlock>
 __global__ void w4a8_codebook_mma_kernel(
     const int8_t* __restrict__ x,
     const int8_t* __restrict__ weight,
-    const uint8_t* __restrict__ s_rel,
     const int8_t* __restrict__ decode_lut,
     int* __restrict__ workspace,
     int M, int N, int K, int G, int split_k)
@@ -159,23 +158,14 @@ __global__ void w4a8_codebook_mma_kernel(
     int acc[4] = {};
     for (int k0 = k_begin; k0 < k_end; k0 += 32) {
         const int k_lane = thread_in_group * 4;
-        const int n_top = n0 + group;
-        const int n_bottom = n_top + 8;
+        const int64_t tile = static_cast<int64_t>(n0 / 16) * (K / 32) + k0 / 32;
+        const int8_t* __restrict__ tile_data = weight + tile * 288;
+        const uint2 packed = reinterpret_cast<const uint2*>(tile_data)[lane];
         unsigned scales = 0;
         if (thread_in_group == 0) {
-            const int groups = K / G;
-            if (n_top < N) {
-                scales |= static_cast<unsigned>(s_rel[static_cast<int64_t>(n_top) * groups + k0 / G]);
-                scales |= static_cast<unsigned>(s_rel[static_cast<int64_t>(n_top) * groups + (k0 + 16) / G]) << 16;
-            }
-            if (n_bottom < N) {
-                scales |= static_cast<unsigned>(s_rel[static_cast<int64_t>(n_bottom) * groups + k0 / G]) << 8;
-                scales |= static_cast<unsigned>(s_rel[static_cast<int64_t>(n_bottom) * groups + (k0 + 16) / G]) << 24;
-            }
+            scales = reinterpret_cast<const unsigned*>(tile_data + 256)[group];
         }
         scales = __shfl_sync(0xffffffffu, scales, group * 4);
-        const int64_t tile = (static_cast<int64_t>(n0 / 16) * (K / 32) + k0 / 32) * 32 + lane;
-        const uint2 packed = reinterpret_cast<const uint2*>(weight)[tile];
         const unsigned a[4] = {
             decode_w4a8_lut4(packed.x & 0xffffu, scales & 0xffu, decode_lut),
             decode_w4a8_lut4(packed.x >> 16, (scales >> 8) & 0xffu, decode_lut),
@@ -311,7 +301,7 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
 }
 
 extern "C" bool launch_w4a8_codebook_mma(
-    const void* xq, const void* weight, const void* s_rel, const void* decode_lut,
+    const void* xq, const void* weight, const void* decode_lut,
     const void* s_channel, const void* xs, const void* bias, void* workspace,
     void* out, int64_t M, int64_t N, int64_t K, int64_t G, int64_t split_k,
     int64_t warps_per_block, int out_dtype_code, cudaStream_t stream)
@@ -342,7 +332,6 @@ extern "C" bool launch_w4a8_codebook_mma(
             <<<grid, WarpsPerBlock * 32, 0, stream>>>(
             static_cast<const int8_t*>(xq),
             static_cast<const int8_t*>(weight),
-            static_cast<const uint8_t*>(s_rel),
             static_cast<const int8_t*>(decode_lut),
             static_cast<int*>(workspace),
             static_cast<int>(M), static_cast<int>(N),
