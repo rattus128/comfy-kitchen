@@ -103,6 +103,135 @@ __global__ void dequant_int4_grouped_to_int8_kernel(
     dequant16_int4_to_int8(pk, codebook ? cb : nullptr, sc0, sc1, sc2, sc3, G, o4);
     *reinterpret_cast<uint4*>(&out[(long)n * K + k0]) = *reinterpret_cast<uint4*>(o4);
 }
+
+__device__ __forceinline__ unsigned decode_w4a8_lut4(
+    unsigned codes, unsigned scale_bits, const int8_t* __restrict__ decode_lut)
+{
+    const int8_t* __restrict__ table = decode_lut + scale_bits * 16;
+    unsigned decoded = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const unsigned code = (codes >> (i * 4)) & 0xfu;
+        decoded |= static_cast<unsigned>(static_cast<uint8_t>(table[code])) << (i * 8);
+    }
+    return decoded;
+}
+
+__device__ __forceinline__ void mma_m16n8k32_s8(
+    int (&acc)[4], const unsigned (&a)[4], const unsigned (&b)[2])
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%0, %1, %2, %3};\n"
+        : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]));
+#endif
+}
+
+// Interpret the usual row-major [tokens, K] activation as column-major [K, tokens]
+// and compute weight[N, K] @ activation[K, tokens]. One warp produces a 16-output
+// by 8-token MMA tile. Split-K restores enough blocks to fill large GPUs; each
+// split atomically contributes exact INT32 partials to the small output workspace.
+// Packed W4 is decoded directly into tensor-core registers, never a weight workspace.
+template <int WarpsPerBlock>
+__global__ void w4a8_codebook_mma_kernel(
+    const int8_t* __restrict__ x,
+    const int8_t* __restrict__ weight,
+    const uint8_t* __restrict__ s_rel,
+    const int8_t* __restrict__ decode_lut,
+    int* __restrict__ workspace,
+    int M, int N, int K, int G, int split_k)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int group = lane >> 2;
+    const int thread_in_group = lane & 3;
+    const int n0 = (static_cast<int>(blockIdx.x) * WarpsPerBlock + warp) * 16;
+    const int k_per_split = K / split_k;
+    const int k_begin = static_cast<int>(blockIdx.y) * k_per_split;
+    const int k_end = k_begin + k_per_split;
+
+    int acc[4] = {};
+    for (int k0 = k_begin; k0 < k_end; k0 += 32) {
+        const int k_lane = thread_in_group * 4;
+        const int n_top = n0 + group;
+        const int n_bottom = n_top + 8;
+        unsigned scales = 0;
+        if (thread_in_group == 0) {
+            const int groups = K / G;
+            if (n_top < N) {
+                scales |= static_cast<unsigned>(s_rel[static_cast<int64_t>(n_top) * groups + k0 / G]);
+                scales |= static_cast<unsigned>(s_rel[static_cast<int64_t>(n_top) * groups + (k0 + 16) / G]) << 16;
+            }
+            if (n_bottom < N) {
+                scales |= static_cast<unsigned>(s_rel[static_cast<int64_t>(n_bottom) * groups + k0 / G]) << 8;
+                scales |= static_cast<unsigned>(s_rel[static_cast<int64_t>(n_bottom) * groups + (k0 + 16) / G]) << 24;
+            }
+        }
+        scales = __shfl_sync(0xffffffffu, scales, group * 4);
+        const int64_t tile = (static_cast<int64_t>(n0 / 16) * (K / 32) + k0 / 32) * 32 + lane;
+        const uint2 packed = reinterpret_cast<const uint2*>(weight)[tile];
+        const unsigned a[4] = {
+            decode_w4a8_lut4(packed.x & 0xffffu, scales & 0xffu, decode_lut),
+            decode_w4a8_lut4(packed.x >> 16, (scales >> 8) & 0xffu, decode_lut),
+            decode_w4a8_lut4(packed.y & 0xffffu, (scales >> 16) & 0xffu, decode_lut),
+            decode_w4a8_lut4(packed.y >> 16, scales >> 24, decode_lut),
+        };
+        const int token = group;
+        const int* __restrict__ x4 = token < M
+            ? reinterpret_cast<const int*>(x + static_cast<int64_t>(token) * K)
+            : nullptr;
+        const unsigned b[2] = {
+            x4 ? static_cast<unsigned>(x4[(k0 + k_lane) / 4]) : 0u,
+            x4 ? static_cast<unsigned>(x4[(k0 + k_lane + 16) / 4]) : 0u,
+        };
+        mma_m16n8k32_s8(acc, a, b);
+    }
+
+    const int token0 = thread_in_group * 2;
+    const int token1 = token0 + 1;
+    const int n_top = n0 + group;
+    const int n_bottom = n_top + 8;
+    if (n_top < N) {
+        if (token0 < M) {
+            atomicAdd(&workspace[static_cast<int64_t>(token0) * N + n_top], acc[0]);
+        }
+        if (token1 < M) {
+            atomicAdd(&workspace[static_cast<int64_t>(token1) * N + n_top], acc[1]);
+        }
+    }
+    if (n_bottom < N) {
+        if (token0 < M) {
+            atomicAdd(&workspace[static_cast<int64_t>(token0) * N + n_bottom], acc[2]);
+        }
+        if (token1 < M) {
+            atomicAdd(&workspace[static_cast<int64_t>(token1) * N + n_bottom], acc[3]);
+        }
+    }
+}
+
+template <typename OutputT>
+__global__ void w4a8_codebook_mma_epilogue(
+    const int* __restrict__ workspace,
+    const float* __restrict__ s_channel,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ bias,
+    OutputT* __restrict__ output,
+    int M, int N)
+{
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<int64_t>(M) * N) return;
+    const int token = index / N;
+    const int n = index - static_cast<int64_t>(token) * N;
+    float value = static_cast<float>(workspace[index]) * x_scales[token] * s_channel[n];
+    if (bias) value += bias[n];
+    output[index] = store_output<OutputT>(value);
+}
 }  // namespace
 
 // codebook: 16 floats (non-uniform levels) or nullptr for uniform (q-8).
@@ -181,6 +310,65 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     return true;
 }
 
+extern "C" bool launch_w4a8_codebook_mma(
+    const void* xq, const void* weight, const void* s_rel, const void* decode_lut,
+    const void* s_channel, const void* xs, const void* bias, void* workspace,
+    void* out, int64_t M, int64_t N, int64_t K, int64_t G, int64_t split_k,
+    int64_t warps_per_block, int out_dtype_code, cudaStream_t stream)
+{
+    if (M == 0 || N == 0 || K == 0) return true;
+    if (M > 8 || decode_lut == nullptr || N > std::numeric_limits<int>::max()
+            || K > std::numeric_limits<int>::max() || K % 32 != 0
+            || G != 16 || K % G != 0 || split_k <= 0
+            || K % (split_k * 32) != 0
+            || (warps_per_block != 1 && warps_per_block != 2
+                && warps_per_block != 4 && warps_per_block != 8)) {
+        return false;
+    }
+    int device = 0;
+    cudaDeviceProp properties{};
+    if (cudaGetDevice(&device) != cudaSuccess
+            || cudaGetDeviceProperties(&properties, device) != cudaSuccess
+            || properties.major < 8) {
+        return false;
+    }
+    cudaMemsetAsync(workspace, 0, M * N * sizeof(int), stream);
+    auto launch = [&]<int WarpsPerBlock>() {
+        constexpr int OutputsPerBlock = WarpsPerBlock * 16;
+        const dim3 grid(
+            static_cast<unsigned int>((N + OutputsPerBlock - 1) / OutputsPerBlock),
+            static_cast<unsigned int>(split_k));
+        w4a8_codebook_mma_kernel<WarpsPerBlock>
+            <<<grid, WarpsPerBlock * 32, 0, stream>>>(
+            static_cast<const int8_t*>(xq),
+            static_cast<const int8_t*>(weight),
+            static_cast<const uint8_t*>(s_rel),
+            static_cast<const int8_t*>(decode_lut),
+            static_cast<int*>(workspace),
+            static_cast<int>(M), static_cast<int>(N),
+            static_cast<int>(K), static_cast<int>(G), static_cast<int>(split_k));
+    };
+    switch (warps_per_block) {
+        case 1: launch.template operator()<1>(); break;
+        case 2: launch.template operator()<2>(); break;
+        case 4: launch.template operator()<4>(); break;
+        case 8: launch.template operator()<8>(); break;
+    }
+    constexpr int EpilogueThreads = 256;
+    const int epilogue_blocks = static_cast<int>((M * N + EpilogueThreads - 1) / EpilogueThreads);
+    DISPATCH_FP_DTYPE(out_dtype_code, OutputT, [&] {
+        w4a8_codebook_mma_epilogue<OutputT><<<epilogue_blocks, EpilogueThreads, 0, stream>>>(
+            static_cast<const int*>(workspace),
+            static_cast<const float*>(s_channel), static_cast<const float*>(xs),
+            static_cast<const float*>(bias), static_cast<OutputT*>(out),
+            static_cast<int>(M), static_cast<int>(N));
+    });
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("W4A8 packed MMA failed: ") + cudaGetErrorString(error));
+    }
+    return true;
+}
 
 
 // W4A8 requantize in one launch: rotated weight -> packed int4 + fp8 s_rel + f32
