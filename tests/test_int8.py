@@ -31,6 +31,20 @@ COMFYUI_NVIDIA_16_SERIES = (
 )
 
 
+@pytest.mark.parametrize(("n", "k"), [(16, 32), (37, 512), (320, 1024)])
+def test_w4a8_mma_pack_roundtrip(n, k):
+    qdata = torch.randint(-128, 128, (n, k // 2), dtype=torch.int8)
+    scale_bits = torch.randint(0, 256, (n, k // 16), dtype=torch.uint8)
+    scales = scale_bits.view(torch.float8_e4m3fn)
+
+    packed = ck.pack_w4a8_mma_weight(qdata, scales)
+    unpacked_qdata, unpacked_scales = ck.unpack_w4a8_mma_weight(packed, n, k)
+
+    assert packed.shape == (((n + 15) // 16 * 16) * k * 9 // 16,)
+    assert torch.equal(unpacked_qdata, qdata)
+    assert torch.equal(unpacked_scales.view(torch.uint8), scale_bits)
+
+
 def test_cuda_int8_cublas_turing_n_alignment(monkeypatch):
     """CUDA cuBLAS fallback pads Turing skinny N to 32."""
     from comfy_kitchen.backends import cuda

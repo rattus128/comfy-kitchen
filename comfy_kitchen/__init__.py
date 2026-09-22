@@ -9,6 +9,10 @@ from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
+from .backends.eager.w4a8_int8 import (
+    pack_w4a8_mma_weight,
+    unpack_w4a8_mma_weight,
+)
 from .exceptions import (
     BackendError,
     BackendNotFoundError,
@@ -85,6 +89,8 @@ __all__ = [
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
     "quantize_w4a8_int8_weight",
+    "pack_w4a8_mma_weight",
+    "unpack_w4a8_mma_weight",
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
     "dequantize_int8_simple",

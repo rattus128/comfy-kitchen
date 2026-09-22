@@ -62,6 +62,7 @@ from comfy_kitchen.constraints import (
     ParamConstraint,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
+    w4a8_storage_call_rule,
 )
 from comfy_kitchen.registry import registry
 
@@ -412,8 +413,8 @@ def _build_constraints() -> dict:
         ),
         "dequantize_w4a8_int8_weight": FunctionConstraints(
             params={
-                "qdata": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
-                "s_rel": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn, torch.float32}), shape_rules=(ExactDims(2),)),
+                "qdata": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "s_rel": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn, torch.float32})),
                 "s_channel": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
                 "codebook": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
                 "correction": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
@@ -422,12 +423,13 @@ def _build_constraints() -> dict:
                 "output_dtype": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=all_devices,
+            call_rules=(w4a8_storage_call_rule,),
         ),
         "w4a8_int8_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
-                "qdata": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
-                "s_rel": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn, torch.float32}), shape_rules=(ExactDims(2),)),
+                "qdata": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "s_rel": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn, torch.float32})),
                 "s_channel": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
                 "codebook": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
                 "correction": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
@@ -437,6 +439,7 @@ def _build_constraints() -> dict:
                 "out_dtype": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=all_devices,
+            call_rules=(w4a8_storage_call_rule,),
         ),
         "prepare_int4_weight_for_int8_linear": FunctionConstraints(
             params={

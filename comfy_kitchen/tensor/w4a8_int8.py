@@ -74,6 +74,7 @@ def dequantize_w4a8_int8_weight(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
+    mma_packed: bool = False,
 ) -> torch.Tensor:
     """Dequantize a packed W4A8 weight into its original basis."""
     kwargs = {
@@ -85,6 +86,7 @@ def dequantize_w4a8_int8_weight(
         "group_size": group_size,
         "convrot_groupsize": convrot_groupsize,
         "output_dtype": output_dtype,
+        "mma_packed": mma_packed,
     }
     impl = registry.get_implementation("dequantize_w4a8_int8_weight", kwargs=kwargs)
     return impl(**kwargs)
@@ -101,6 +103,7 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    mma_packed: bool = False,
 ) -> torch.Tensor:
     """Compute ``x @ W.T + bias`` with the selected W4A8 backend."""
     kwargs = {
@@ -114,6 +117,7 @@ def w4a8_int8_linear(
         "group_size": group_size,
         "convrot_groupsize": convrot_groupsize,
         "out_dtype": out_dtype,
+        "mma_packed": mma_packed,
     }
     impl = registry.get_implementation("w4a8_int8_linear", kwargs=kwargs)
     return impl(**kwargs)
@@ -133,6 +137,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         codebook: torch.Tensor | None = None
         group_size: int = 16
         convrot_groupsize: int = 256
+        mma_packed: bool = False
         transposed: bool = False
 
         def _tensor_fields(self) -> list[str]:
@@ -162,7 +167,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                     f"and divide 16 or be a multiple of 16"
                 )
             groups = k // self.group_size
-            expected_scale_shape = (n, groups)
+            expected_scale_shape = (0,) if self.mma_packed else (n, groups)
             if tuple(self.scale.shape) != expected_scale_shape:
                 raise ValueError(
                     f"scale must have shape {expected_scale_shape}, got {tuple(self.scale.shape)}"
@@ -225,6 +230,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             group_size=params.group_size,
             convrot_groupsize=params.convrot_groupsize,
             output_dtype=params.orig_dtype,
+            mma_packed=params.mma_packed,
         )
 
     @classmethod
@@ -302,6 +308,7 @@ def _w4a8_int8_forward(
         group_size=params.group_size,
         convrot_groupsize=params.convrot_groupsize,
         out_dtype=out_dtype,
+        mma_packed=params.mma_packed,
     )
 
 

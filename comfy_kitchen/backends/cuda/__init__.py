@@ -197,10 +197,12 @@ from comfy_kitchen.backends.eager.svdquant import (  # noqa: E402
     _unpack_int4_row_major,
 )
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
+    _FIXED_LUT,
     _QUANT_ROW_ELEM_BUDGET,
     _decide_codebook,
     _dequantize_w4a8_int8_weight_from_int8,
     _quantize_w4a8_chunked,
+    unpack_w4a8_mma_weight,
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
@@ -216,6 +218,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     ValidationResult,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
+    w4a8_storage_call_rule,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
@@ -237,6 +240,25 @@ _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBA
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
 _W4A8_CHUNKED = os.environ.get("COMFY_KITCHEN_W4A8_CHUNKED", "1") != "0"
+_W4A8_FIXED_DECODE_LUTS: dict[torch.device, torch.Tensor] = {}
+
+
+def _w4a8_fixed_decode_lut(device: torch.device) -> torch.Tensor:
+    if (decode_lut := _W4A8_FIXED_DECODE_LUTS.get(device)) is None:
+        codebook = torch.tensor(_FIXED_LUT, dtype=torch.float32, device=device)
+        scales = torch.arange(256, dtype=torch.uint8, device=device)
+        scales = scales.view(torch.float8_e4m3fn).float()
+        decode_lut = (
+            (scales[:, None] * codebook[None, :])
+            .round_()
+            .clamp_(-127, 127)
+            .to(torch.int8)
+            .contiguous()
+        )
+        _W4A8_FIXED_DECODE_LUTS[device] = decode_lut
+    return decode_lut
+
+
 _NVIDIA_16_SERIES = (
     "1660",
     "1650",
@@ -2228,8 +2250,13 @@ def dequantize_w4a8_int8_weight(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
+    mma_packed: bool = False,
 ) -> torch.Tensor:
     """Dequantize W4A8 weights with native CUDA decode and ConvRot operations."""
+    if mma_packed:
+        n = s_channel.numel()
+        k = qdata.numel() * 16 // (((n + 15) // 16) * 9)
+        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k)
     validate_w4a8_operands(
         qdata,
         s_rel,
@@ -2285,19 +2312,34 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    mma_packed: bool = False,
 ) -> torch.Tensor:
     """CUDA W4A8 linear using chunked INT4 decode and the tuned INT8 GEMM."""
-    validate_w4a8_operands(
-        qdata,
-        s_rel,
-        s_channel,
-        codebook,
-        correction,
-        group_size,
-        convrot_groupsize,
-    )
-    n, k_half = qdata.shape
-    k = k_half * 2
+    if mma_packed:
+        n = s_channel.numel()
+        k = x.shape[-1]
+        expected = ((n + 15) // 16 * 16) * k * 9 // 16
+        if (
+            qdata.dim() != 1
+            or qdata.dtype != torch.int8
+            or qdata.numel() != expected
+            or s_rel.numel() != 0
+            or group_size != 16
+            or correction is not None
+        ):
+            raise ValueError("invalid MMA-packed W4A8 operands")
+    else:
+        validate_w4a8_operands(
+            qdata,
+            s_rel,
+            s_channel,
+            codebook,
+            correction,
+            group_size,
+            convrot_groupsize,
+        )
+        n, k_half = qdata.shape
+        k = k_half * 2
     if x.shape[-1] != k:
         raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
     groups = k // group_size
@@ -2314,11 +2356,13 @@ def w4a8_int8_linear(
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
     # both the chunked kernels and the 2-pass CUTLASS fallback read bias in the output dtype
     bias_arg = _gemm_vector_arg(bias, x.device, out_dtype) if bias is not None else None
+    bias_float = bias.float().contiguous() if bias is not None else None
 
     # Decode fast path: fused in-register dequant GEMV, no int8 workspace round-trip.
     # Bit-exact with the chunked path (same rounded int8 grid and epilogue).
     if (
         _W4A8_CHUNKED
+        and not mma_packed
         and m <= 8
         and correction is None
         and s_rel.dtype == torch.float8_e4m3fn
@@ -2342,6 +2386,34 @@ def w4a8_int8_linear(
         )
         if used:
             return out.reshape(*x.shape[:-1], n)
+
+    if mma_packed and m <= 8:
+        workspace = torch.empty(m, n, dtype=torch.int32, device=x.device)
+        decode_lut = _w4a8_fixed_decode_lut(qdata.device)
+        split_k = k // 512 if k % 512 == 0 else 1
+        used = _C.w4a8_codebook_mma_linear(
+            _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(xq),
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(decode_lut),
+            _wrap_for_dlpack(s_channel),
+            _wrap_for_dlpack(xs),
+            _wrap_for_dlpack(bias_float) if bias_float is not None else None,
+            _wrap_for_dlpack(workspace),
+            _wrap_for_dlpack(out),
+            convrot_groupsize,
+            group_size,
+            split_k,
+            8,
+            output_dtype_code,
+            stream_ptr,
+        )
+        if used:
+            return out.reshape(*x.shape[:-1], n)
+        raise RuntimeError("MMA-packed W4A8 weight is unsupported on this device")
+
+    if mma_packed:
+        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k)
 
     chunked = (
         _W4A8_CHUNKED
@@ -4024,11 +4096,9 @@ def _build_constraints() -> dict:
             params={
                 "qdata": ParamConstraint(
                     dtypes=frozenset({torch.int8}),
-                    shape_rules=(ExactDims(2),),
                 ),
                 "s_rel": ParamConstraint(
                     dtypes=frozenset({torch.float8_e4m3fn, torch.float32}),
-                    shape_rules=(ExactDims(2),),
                 ),
                 "s_channel": ParamConstraint(
                     dtypes=frozenset({torch.float32}),
@@ -4050,6 +4120,7 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),
+            call_rules=(w4a8_storage_call_rule,),
         ),
         "w4a8_int8_linear": FunctionConstraints(
             params={
@@ -4058,11 +4129,9 @@ def _build_constraints() -> dict:
                 ),
                 "qdata": ParamConstraint(
                     dtypes=frozenset({torch.int8}),
-                    shape_rules=(ExactDims(2),),
                 ),
                 "s_rel": ParamConstraint(
                     dtypes=frozenset({torch.float8_e4m3fn, torch.float32}),
-                    shape_rules=(ExactDims(2),),
                 ),
                 "s_channel": ParamConstraint(
                     dtypes=frozenset({torch.float32}),
@@ -4087,6 +4156,7 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),
+            call_rules=(w4a8_storage_call_rule,),
         ),
         "dequantize_int8_convrot_weight": FunctionConstraints(
             params={
@@ -4389,4 +4459,3 @@ def _register():
 
 
 _register()
-

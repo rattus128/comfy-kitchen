@@ -16,6 +16,7 @@ __all__ = [
     "ValidationResult",
     "validate_function_call",
     "validate_param",
+    "w4a8_storage_call_rule",
 ]
 
 
@@ -349,4 +350,16 @@ def na3d_common_call_rule(kwargs):
         return ValidationResult.fail(
             "kernel_size", f"entries must be positive, got {list(kernel_size)}"
         )
+    return ValidationResult.ok()
+
+
+def w4a8_storage_call_rule(kwargs):
+    """Validate conventional 2D or MMA-packed 1D W4A8 storage."""
+    expected_dims = 1 if kwargs.get("mma_packed", False) else 2
+    for name in ("qdata", "s_rel"):
+        tensor = kwargs.get(name)
+        if tensor is not None and tensor.dim() != expected_dims:
+            return ValidationResult.fail(
+                name, f"shape {list(tensor.shape)} fails: exactly {expected_dims}D"
+            )
     return ValidationResult.ok()

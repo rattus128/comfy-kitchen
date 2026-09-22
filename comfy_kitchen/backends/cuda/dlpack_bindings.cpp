@@ -3151,6 +3151,56 @@ bool w4a8_codebook_mma(
         out_dtype_code,
         reinterpret_cast<cudaStream_t>(stream_ptr));
 }
+
+bool w4a8_codebook_mma_linear(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,
+    nb::ndarray<int8_t, nb::ndim<1>, nb::device::cuda> weight,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> decode_lut,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> xs,
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> bias,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> workspace,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
+    int64_t convrot_group_size, int64_t G, int64_t split_k,
+    int64_t warps_per_block, int out_dtype_code, uintptr_t stream_ptr) {
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+    const int64_t N = s_channel.size();
+    const int64_t padded_N = (N + 15) / 16 * 16;
+    if (M > 8 || xq.shape(0) != M || xq.shape(1) != K
+            || xs.shape(0) != M || xs.shape(1) != 1
+            || weight.size() != padded_N * K * 9 / 16 || K % G != 0)
+        throw std::runtime_error("w4a8_codebook_mma_linear shape mismatch or M > 8");
+    if (decode_lut.shape(0) != 256 || decode_lut.shape(1) != 16
+            || decode_lut.stride(1) != 1 || decode_lut.stride(0) != 16)
+        throw std::runtime_error("w4a8_codebook_mma_linear decode LUT must be contiguous [256, 16]");
+    if ((bias.has_value() && bias->size() != N)
+            || workspace.shape(0) != M || workspace.shape(1) != N
+            || out.shape(0) != M || out.shape(1) != N
+            || map_dtype_to_code(out.dtype()) != out_dtype_code)
+        throw std::runtime_error("w4a8_codebook_mma_linear workspace, output, or bias mismatch");
+    if (input.stride(1) != 1 || input.stride(0) != K
+            || xq.stride(1) != 1 || xq.stride(0) != K
+            || weight.stride(0) != 1 || s_channel.stride(0) != 1
+            || xs.stride(1) != 1 || xs.stride(0) != 1
+            || workspace.stride(1) != 1 || workspace.stride(0) != N
+            || out.stride(1) != 1 || out.stride(0) != N)
+        throw std::runtime_error("w4a8_codebook_mma_linear requires contiguous tensors");
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2)
+        throw std::runtime_error("w4a8_codebook_mma_linear input must be fp32, fp16, or bf16");
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_int8_rowwise_convrot_kernel(
+        input.data(), xq.data(), xs.data(), M, K,
+        static_cast<int>(convrot_group_size), input_dtype_code,
+        false, 0, stream);
+    return launch_w4a8_codebook_mma(
+        xq.data(), weight.data(), decode_lut.data(), s_channel.data(), xs.data(),
+        bias.has_value() ? bias->data() : nullptr, workspace.data(), out.data(),
+        M, N, K, G, split_k, warps_per_block, out_dtype_code, stream);
+}
 // Common W4A8 inference path: online ConvRot activation quantization followed by the
 // chunked int4 decode + strided INT8 GEMM, coordinated through one Python/native call.
 bool w4a8_codebook_linear_chunked(
@@ -4133,6 +4183,13 @@ NB_MODULE(_C, m) {
           nb::arg("s_channel"), nb::arg("xs"), nb::arg("bias").none(),
           nb::arg("workspace"), nb::arg("out"), nb::arg("g"), nb::arg("split_k"),
           nb::arg("warps_per_block"), nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
+    m.def("w4a8_codebook_mma_linear", &w4a8_codebook_mma_linear,
+          "Fused ConvRot activation quantization and direct packed W4A8 tensor-core MMA",
+          nb::arg("input"), nb::arg("xq"), nb::arg("weight"), nb::arg("decode_lut"),
+          nb::arg("s_channel"), nb::arg("xs"), nb::arg("bias").none(),
+          nb::arg("workspace"), nb::arg("out"), nb::arg("convrot_group_size"),
+          nb::arg("g"), nb::arg("split_k"), nb::arg("warps_per_block"),
+          nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
     m.def("w4a8_codebook_linear_chunked", &w4a8_codebook_linear_chunked,
           "Fused W4A8 inference orchestration: ConvRot activation quantization followed by chunked decode/GEMM",
           nb::arg("input"), nb::arg("xq"), nb::arg("xs"), nb::arg("weight"),

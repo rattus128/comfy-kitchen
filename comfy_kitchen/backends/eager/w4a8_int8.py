@@ -453,6 +453,91 @@ def validate_w4a8_operands(
         raise ValueError(f"codebook must have shape (16,), got {tuple(codebook.shape)}")
 
 
+def pack_w4a8_mma_weight(
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+) -> torch.Tensor:
+    """Relay conventional W4A8 tensors into 16x32 MMA records."""
+    if qdata.dim() != 2 or qdata.dtype != torch.int8:
+        raise ValueError("qdata must be a 2D int8 tensor")
+    n, k_half = qdata.shape
+    k = k_half * 2
+    if k % 32 != 0 or tuple(s_rel.shape) != (n, k // 16):
+        raise ValueError("MMA packing requires group_size 16 and K divisible by 32")
+    padded_n = (n + 15) // 16 * 16
+    padded = torch.zeros((padded_n, k_half), device=qdata.device, dtype=torch.int8)
+    padded[:n].copy_(qdata)
+    tiles = padded.view(padded_n // 16, 16, k // 32, 16).permute(0, 2, 1, 3)
+    fragments = torch.stack(
+        (
+            tiles[:, :, :8, :8].reshape(padded_n // 16, k // 32, 8, 4, 2),
+            tiles[:, :, 8:, :8].reshape(padded_n // 16, k // 32, 8, 4, 2),
+            tiles[:, :, :8, 8:].reshape(padded_n // 16, k // 32, 8, 4, 2),
+            tiles[:, :, 8:, 8:].reshape(padded_n // 16, k // 32, 8, 4, 2),
+        ),
+        dim=4,
+    )
+    weight_bytes = fragments.contiguous().view(padded_n // 16, k // 32, 256)
+
+    padded_scales = torch.zeros(
+        (padded_n, k // 16), device=s_rel.device, dtype=torch.uint8
+    )
+    padded_scales[:n].copy_(s_rel.view(torch.uint8))
+    scale_tiles = padded_scales.view(padded_n // 16, 16, k // 32, 2).permute(0, 2, 1, 3)
+    scale_bytes = torch.stack(
+        (
+            scale_tiles[:, :, :8, 0],
+            scale_tiles[:, :, 8:, 0],
+            scale_tiles[:, :, :8, 1],
+            scale_tiles[:, :, 8:, 1],
+        ),
+        dim=3,
+    ).contiguous().view(padded_n // 16, k // 32, 32)
+    return torch.cat((weight_bytes.view(torch.uint8), scale_bytes), dim=2).view(torch.int8).view(-1)
+
+
+def unpack_w4a8_mma_weight(
+    packed: torch.Tensor,
+    n: int,
+    k: int,
+    scale_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Restore conventional qdata and scales for prefill and dequantization."""
+    padded_n = (n + 15) // 16 * 16
+    expected = padded_n * k * 9 // 16
+    if packed.dim() != 1 or packed.dtype != torch.int8 or packed.numel() != expected:
+        raise ValueError(f"MMA packed weight must be a contiguous int8 [{expected}] tensor")
+    records = packed.view(torch.uint8).view(padded_n // 16, k // 32, 288)
+    fragments = records[:, :, :256].view(padded_n // 16, k // 32, 8, 4, 4, 2)
+    tiles = torch.empty(
+        (padded_n // 16, k // 32, 16, 16), dtype=torch.uint8, device=packed.device
+    )
+    tiles[:, :, :8, :8] = fragments[:, :, :, :, 0, :].reshape(
+        padded_n // 16, k // 32, 8, 8
+    )
+    tiles[:, :, 8:, :8] = fragments[:, :, :, :, 1, :].reshape(
+        padded_n // 16, k // 32, 8, 8
+    )
+    tiles[:, :, :8, 8:] = fragments[:, :, :, :, 2, :].reshape(
+        padded_n // 16, k // 32, 8, 8
+    )
+    tiles[:, :, 8:, 8:] = fragments[:, :, :, :, 3, :].reshape(
+        padded_n // 16, k // 32, 8, 8
+    )
+    qdata = tiles.permute(0, 2, 1, 3).contiguous().view(padded_n, k // 2)[:n]
+
+    scale_fragments = records[:, :, 256:].view(padded_n // 16, k // 32, 8, 4)
+    scale_tiles = torch.empty(
+        (padded_n // 16, k // 32, 16, 2), dtype=torch.uint8, device=packed.device
+    )
+    scale_tiles[:, :, :8, 0] = scale_fragments[:, :, :, 0]
+    scale_tiles[:, :, 8:, 0] = scale_fragments[:, :, :, 1]
+    scale_tiles[:, :, :8, 1] = scale_fragments[:, :, :, 2]
+    scale_tiles[:, :, 8:, 1] = scale_fragments[:, :, :, 3]
+    scales = scale_tiles.permute(0, 2, 1, 3).contiguous().view(padded_n, k // 16)[:n]
+    return qdata.view(torch.int8), scales.view(scale_dtype)
+
+
 def _dequantize_w4a8_int8_weight_from_int8(
     int8_weight: torch.Tensor,
     s_channel: torch.Tensor,
@@ -479,8 +564,13 @@ def dequantize_w4a8_int8_weight(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
+    mma_packed: bool = False,
 ) -> torch.Tensor:
     """Decode W4A8 storage into its physical [N, K] floating weight."""
+    if mma_packed:
+        n = s_channel.numel()
+        k = qdata.numel() * 16 // (((n + 15) // 16) * 9)
+        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k)
     validate_w4a8_operands(
         qdata,
         s_rel,
@@ -517,8 +607,13 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    mma_packed: bool = False,
 ) -> torch.Tensor:
     """Compute x @ W.T + bias using portable W4A8 operations."""
+    if mma_packed:
+        qdata, s_rel = unpack_w4a8_mma_weight(
+            qdata, s_channel.numel(), x.shape[-1]
+        )
     validate_w4a8_operands(
         qdata,
         s_rel,
