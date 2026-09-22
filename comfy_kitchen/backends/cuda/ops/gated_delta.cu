@@ -39,7 +39,7 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
 }
 
 // gate projections, gate math, q/k normalization, S delta-rule steps and the gated RMSNorm in one block
-template <typename T, int DK, int MAXS>
+template <typename T, int DK, int MAXS, int RECURRENCE_UNROLL = 4>
 __global__ void gated_delta_decode_fused_kernel(
     const T* __restrict__ mixed_qkv,   // [B, C, S] conv+silu output
     const T* __restrict__ x,           // [B, S, Hd]
@@ -168,18 +168,17 @@ __global__ void gated_delta_decode_fused_kernel(
         if (t < DV) {
             const float g_s = gs[s], b_s = beta[s];
             float kvm = 0.0f;
-            #pragma unroll 4
+            #pragma unroll RECURRENCE_UNROLL
             for (int kk = 0; kk < DK; ++kk) {
                 const float sv = sm[kk * DV + t] * g_s;
-                sm[kk * DV + t] = sv;
                 kvm = fmaf(skr[kk], sv, kvm);
             }
             const float vv = to_f<T>(mixed_qkv[(vbase + t) * S + s]);
             const float delta = (vv - kvm) * b_s;
             float o = 0.0f;
-            #pragma unroll 4
+            #pragma unroll RECURRENCE_UNROLL
             for (int kk = 0; kk < DK; ++kk) {
-                const float sv = fmaf(skr[kk], delta, sm[kk * DV + t]);
+                const float sv = fmaf(skr[kk], delta, sm[kk * DV + t] * g_s);
                 sm[kk * DV + t] = sv;
                 o = fmaf(sqr[kk], sv, o);
             }
@@ -268,7 +267,7 @@ __global__ void deltanet_conv_step_kernel(
 
 // opt the kernel into the device's full dynamic shared memory once per (device, kernel)
 bool fused_shmem_ok(const void* fn, int fn_slot, size_t shmem) {
-    constexpr int MAX_DEV = 16, SLOTS = 3;
+    constexpr int MAX_DEV = 16, SLOTS = 6;
     static int max_shmem[MAX_DEV] = {};
     static bool attr_set[MAX_DEV][SLOTS] = {};
     int dev = 0;
@@ -301,21 +300,27 @@ extern "C" bool launch_gated_delta_decode_fused(
             || dtype_code < 0 || dtype_code > 2)
         return false;
     const int threads = DV > 128 ? static_cast<int>(DV) : 128;
-    const size_t shmem = (static_cast<size_t>(DK) * DV + 2 * MAXS * DK + 4 * MAXS * (threads / 32)) * sizeof(float);
     return DISPATCH_FP_DTYPE(dtype_code, T, [&] {
-        auto kfn = gated_delta_decode_fused_kernel<T, 128, MAXS>;
-        if (!fused_shmem_ok(reinterpret_cast<const void*>(kfn), dtype_code, shmem))
-            return false;
-        kfn<<<static_cast<unsigned>(B * Hv), threads, shmem, stream>>>(
-            static_cast<const T*>(mixed_qkv), static_cast<const T*>(x),
-            static_cast<const T*>(w_a), static_cast<const T*>(w_b),
-            static_cast<const float*>(dt_bias), static_cast<const float*>(g_decay),
-            static_cast<float*>(state), static_cast<T*>(out), static_cast<float*>(snapshots),
-            static_cast<const T*>(z), static_cast<const T*>(norm_w), eps,
-            static_cast<int>(B), static_cast<int>(Hv), static_cast<int>(Hk), static_cast<int>(S),
-            static_cast<int>(DV), static_cast<int>(C), static_cast<int>(Hd),
-            static_cast<int>(key_dim), scale);
-        return cudaGetLastError() == cudaSuccess;
+        auto launch = [&]<int Steps>() {
+            const size_t shmem = (static_cast<size_t>(DK) * DV + 2 * Steps * DK
+                + 4 * Steps * (threads / 32)) * sizeof(float);
+            constexpr int recurrence_unroll = Steps == 6 ? 32 : 4;
+            auto kfn = gated_delta_decode_fused_kernel<T, 128, Steps, recurrence_unroll>;
+            const int fn_slot = dtype_code + (Steps == 6 ? 3 : 0);
+            if (!fused_shmem_ok(reinterpret_cast<const void*>(kfn), fn_slot, shmem))
+                return false;
+            kfn<<<static_cast<unsigned>(B * Hv), threads, shmem, stream>>>(
+                static_cast<const T*>(mixed_qkv), static_cast<const T*>(x),
+                static_cast<const T*>(w_a), static_cast<const T*>(w_b),
+                static_cast<const float*>(dt_bias), static_cast<const float*>(g_decay),
+                static_cast<float*>(state), static_cast<T*>(out), static_cast<float*>(snapshots),
+                static_cast<const T*>(z), static_cast<const T*>(norm_w), eps,
+                static_cast<int>(B), static_cast<int>(Hv), static_cast<int>(Hk), static_cast<int>(S),
+                static_cast<int>(DV), static_cast<int>(C), static_cast<int>(Hd),
+                static_cast<int>(key_dim), scale);
+            return cudaGetLastError() == cudaSuccess;
+        };
+        return S == 6 ? launch.template operator()<6>() : launch.template operator()<MAXS>();
     });
 }
 

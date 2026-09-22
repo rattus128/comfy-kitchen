@@ -3154,6 +3154,8 @@ bool w4a8_codebook_mma(
 
 bool w4a8_codebook_mma_linear(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> rotated,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> partial_absmax,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,
     nb::ndarray<int8_t, nb::ndim<1>, nb::device::cuda> weight,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> decode_lut,
@@ -3168,8 +3170,13 @@ bool w4a8_codebook_mma_linear(
     const int64_t K = input.shape(1);
     const int64_t N = s_channel.size();
     const int64_t padded_N = (N + 15) / 16 * 16;
-    if (M > 8 || xq.shape(0) != M || xq.shape(1) != K
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (M > 8 || convrot_group_size <= 0 || K % convrot_group_size != 0
+            || xq.shape(0) != M || xq.shape(1) != K
             || xs.shape(0) != M || xs.shape(1) != 1
+            || rotated.shape(0) != M || rotated.shape(1) != K
+            || map_dtype_to_code(rotated.dtype()) != input_dtype_code
+            || partial_absmax.shape(0) != M || partial_absmax.shape(1) != K / convrot_group_size
             || weight.size() != padded_N * K * 9 / 16 || K % G != 0)
         throw std::runtime_error("w4a8_codebook_mma_linear shape mismatch or M > 8");
     if (decode_lut.shape(0) != 256 || decode_lut.shape(1) != 16
@@ -3181,20 +3188,21 @@ bool w4a8_codebook_mma_linear(
             || map_dtype_to_code(out.dtype()) != out_dtype_code)
         throw std::runtime_error("w4a8_codebook_mma_linear workspace, output, or bias mismatch");
     if (input.stride(1) != 1 || input.stride(0) != K
+            || rotated.stride(1) != 1 || rotated.stride(0) != K
+            || partial_absmax.stride(1) != 1 || partial_absmax.stride(0) != K / convrot_group_size
             || xq.stride(1) != 1 || xq.stride(0) != K
             || weight.stride(0) != 1 || s_channel.stride(0) != 1
             || xs.stride(1) != 1 || xs.stride(0) != 1
             || workspace.stride(1) != 1 || workspace.stride(0) != N
             || out.stride(1) != 1 || out.stride(0) != N)
         throw std::runtime_error("w4a8_codebook_mma_linear requires contiguous tensors");
-    const int input_dtype_code = map_dtype_to_code(input.dtype());
     if (input_dtype_code < 0 || input_dtype_code > 2)
         throw std::runtime_error("w4a8_codebook_mma_linear input must be fp32, fp16, or bf16");
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_quantize_int8_rowwise_convrot_kernel(
-        input.data(), xq.data(), xs.data(), M, K,
-        static_cast<int>(convrot_group_size), input_dtype_code,
+    launch_quantize_int8_convrot_staged_kernel(
+        input.data(), rotated.data(), partial_absmax.data(), xq.data(), xs.data(), M, K,
+        static_cast<int>(convrot_group_size), input_dtype_code, input_dtype_code,
         false, 0, stream);
     return launch_w4a8_codebook_mma(
         xq.data(), weight.data(), decode_lut.data(), s_channel.data(), xs.data(),
@@ -4184,8 +4192,9 @@ NB_MODULE(_C, m) {
           nb::arg("workspace"), nb::arg("out"), nb::arg("g"), nb::arg("split_k"),
           nb::arg("warps_per_block"), nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
     m.def("w4a8_codebook_mma_linear", &w4a8_codebook_mma_linear,
-          "Fused ConvRot activation quantization and direct packed W4A8 tensor-core MMA",
-          nb::arg("input"), nb::arg("xq"), nb::arg("weight"), nb::arg("decode_lut"),
+          "Staged ConvRot activation quantization and direct packed W4A8 tensor-core MMA",
+          nb::arg("input"), nb::arg("rotated"), nb::arg("partial_absmax"), nb::arg("xq"),
+          nb::arg("weight"), nb::arg("decode_lut"),
           nb::arg("s_channel"), nb::arg("xs"), nb::arg("bias").none(),
           nb::arg("workspace"), nb::arg("out"), nb::arg("convrot_group_size"),
           nb::arg("g"), nb::arg("split_k"), nb::arg("warps_per_block"),

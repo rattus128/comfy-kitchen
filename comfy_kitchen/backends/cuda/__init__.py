@@ -2389,10 +2389,16 @@ def w4a8_int8_linear(
 
     if mma_packed and m <= 8:
         workspace = torch.empty(m, n, dtype=torch.int32, device=x.device)
+        rotated = torch.empty_like(x_2d)
+        partial_absmax = torch.empty(
+            m, k // convrot_groupsize, dtype=torch.float32, device=x.device
+        )
         decode_lut = _w4a8_fixed_decode_lut(qdata.device)
         split_k = k // 512 if k % 512 == 0 else 1
         used = _C.w4a8_codebook_mma_linear(
             _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(rotated),
+            _wrap_for_dlpack(partial_absmax),
             _wrap_for_dlpack(xq),
             _wrap_for_dlpack(qdata),
             _wrap_for_dlpack(decode_lut),
