@@ -1129,6 +1129,7 @@ def dequantize_w4a8_int8_weight(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
+    mma_rows: int = 16,
 ) -> torch.Tensor:
     """Decode W4A8 storage into its physical [N, K] floating weight."""
     validate_w4a8_operands(
@@ -1154,6 +1155,10 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    mma_rows: int = 16,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
 ) -> torch.Tensor:
     """``x @ W.T + bias`` via the HIP INT4 decode feeding the WMMA INT8 GEMM.
 
@@ -1163,6 +1168,7 @@ def w4a8_int8_linear(
     packed weight itself, so a few rows take a GEMV that dequantizes in registers
     and never writes the INT8 weight at all.
     """
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
     validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
     )

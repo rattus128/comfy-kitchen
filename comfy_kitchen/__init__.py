@@ -21,9 +21,21 @@ from .exceptions import (
 )
 from .flash_attention import flash_attention_decode
 from .flash_attention import is_available as flash_attention_decode_is_available
+from .flash_attention import flash_attention_decode_gqa, flash_attention_decode_gqa_is_available
 from .float_utils import from_blocked, swap_nibbles, to_blocked
+from .prefetch_ring import (
+    configure as configure_prefetch_ring,
+    disable as disable_prefetch_ring,
+    is_available as prefetch_ring_is_available,
+    record_region as record_prefetch_region,
+    set_record_region as set_prefetch_ring_recorder,
+    start as start_prefetch_ring,
+)
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
+from .gated_delta import deferred_is_available as gated_delta_deferred_is_available
+from .gated_delta import deferred_buffers as gated_delta_deferred_buffers
+from .gated_delta import deltanet_conv_step_deferred, gated_delta_decode_deferred
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
@@ -70,10 +82,22 @@ __all__ = [
     "int8_attention_is_available",
     "prequantize_int8_attention",
     "flash_attention_decode",
+    "flash_attention_decode_gqa",
+    "flash_attention_decode_gqa_is_available",
     "gated_delta_decode_fused",
     "deltanet_conv_step",
     "gated_delta_decode_is_available",
+    "gated_delta_deferred_is_available",
+    "gated_delta_deferred_buffers",
+    "deltanet_conv_step_deferred",
+    "gated_delta_decode_deferred",
     "flash_attention_decode_is_available",
+    "configure_prefetch_ring",
+    "disable_prefetch_ring",
+    "prefetch_ring_is_available",
+    "record_prefetch_region",
+    "set_prefetch_ring_recorder",
+    "start_prefetch_ring",
     "na2d",
     "na3d",
     "sol_attn",

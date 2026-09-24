@@ -27,6 +27,7 @@ from comfy_kitchen._rope_utils import (
     trim_rope_freqs,
 )
 from comfy_kitchen.allocation import allocation_context
+from comfy_kitchen import prefetch_ring as _prefetch_ring
 
 __all__ = [
     "na3d",
@@ -257,6 +258,24 @@ def _w4a8_fixed_decode_lut(device: torch.device) -> torch.Tensor:
         )
         _W4A8_FIXED_DECODE_LUTS[device] = decode_lut
     return decode_lut
+
+
+# Split-K reduction scratch for the packed MMA decode kernel: [8, N] int32 partial
+# sums plus one arrival counter per 16-column tile. The kernel returns both to zero
+# before it exits, so one zeroed pair per (device, N) serves every call (M <= 8) and
+# no memset or epilogue launch is needed. Single-stream: two concurrent launches for
+# the same N would share the scratch.
+_W4A8_MMA_SCRATCH: dict[tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _w4a8_mma_scratch(device: torch.device, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (device, n)
+    if (scratch := _W4A8_MMA_SCRATCH.get(key)) is None:
+        with allocation_context():
+            workspace = torch.zeros(8, n, dtype=torch.int32, device=device)
+            counters = torch.zeros((n + 15) // 16, dtype=torch.int32, device=device)
+        scratch = _W4A8_MMA_SCRATCH[key] = (workspace, counters)
+    return scratch
 
 
 _NVIDIA_16_SERIES = (
@@ -2251,12 +2270,13 @@ def dequantize_w4a8_int8_weight(
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
     mma_packed: bool = False,
+    mma_rows: int = 16,
 ) -> torch.Tensor:
     """Dequantize W4A8 weights with native CUDA decode and ConvRot operations."""
     if mma_packed:
         n = s_channel.numel()
         k = qdata.numel() * 16 // (((n + 15) // 16) * 9)
-        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k)
+        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k, rows_per_split=mma_rows)
     validate_w4a8_operands(
         qdata,
         s_rel,
@@ -2301,6 +2321,28 @@ def dequantize_w4a8_int8_weight(
     return rotate_int8_convrot_weight(weight_rotated.contiguous(), convrot_groupsize).to(output_dtype)
 
 
+def _record_w4a8_read_order(qdata: torch.Tensor, n: int, k: int, pack_rows: int) -> None:
+    """Record the MMA-packed weight for the prefetch ring in the order the GEMM reads it.
+
+    The packing is split-major: run i (i = split * runs + r, `runs` runs of
+    pack_rows records per warp) is tiles * pack_rows * 288 contiguous bytes. The
+    streamed kernel runs every k-split in one wave and each warp walks its runs
+    in order, so the bytes are demanded run-index-major: r outer, split inner.
+    """
+    rows = _C.w4a8_stream_rows(n, k, pack_rows)
+    runs = rows // pack_rows if rows else 1
+    if runs == 1:
+        _prefetch_ring.record_region(qdata)
+        return
+    splits = k // 32 // rows
+    run_bytes = (n // 16) * pack_rows * 288
+    flat = qdata.view(-1)
+    for r in range(runs):
+        for s in range(splits):
+            i = s * runs + r
+            _prefetch_ring.record_region(flat[i * run_bytes:(i + 1) * run_bytes])
+
+
 def w4a8_int8_linear(
     x: torch.Tensor,
     qdata: torch.Tensor,
@@ -2313,11 +2355,33 @@ def w4a8_int8_linear(
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
     mma_packed: bool = False,
+    mma_rows: int = 16,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
 ) -> torch.Tensor:
-    """CUDA W4A8 linear using chunked INT4 decode and the tuned INT8 GEMM."""
+    """CUDA W4A8 linear using chunked INT4 decode and the tuned INT8 GEMM.
+
+    input_act is folded into the packed-MMA decode quantizer (one cluster kernel
+    per row on sm_90+); every other path applies it eagerly first.
+    """
+    if input_act in (None, "none"):
+        input_act = None
+    k_act = x.shape[-1] // _input_act_width(input_act)
+    fuse_act = (
+        input_act is not None
+        and mma_packed
+        and x.numel() <= 8 * x.shape[-1]
+        and k_act % 256 == 0
+        and k_act <= 256 * 8 * 8 * 4
+        and _cuda_device_capability(x.device.index)[0] >= 9
+    )
+    if input_act is not None and not fuse_act:
+        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+        input_act = None
     if mma_packed:
         n = s_channel.numel()
-        k = x.shape[-1]
+        k = k_act
         expected = ((n + 15) // 16 * 16) * k * 9 // 16
         if (
             qdata.dim() != 1
@@ -2340,10 +2404,10 @@ def w4a8_int8_linear(
         )
         n, k_half = qdata.shape
         k = k_half * 2
-    if x.shape[-1] != k:
-        raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
+    if k_act != k:
+        raise ValueError(f"Input K={k_act} does not match qdata K={k}")
     groups = k // group_size
-    x_2d = x.reshape(-1, k).contiguous()
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     output_dtype_code = DTYPE_TO_CODE[out_dtype]
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
@@ -2388,17 +2452,32 @@ def w4a8_int8_linear(
             return out.reshape(*x.shape[:-1], n)
 
     if mma_packed and m <= 8:
-        workspace = torch.empty(m, n, dtype=torch.int32, device=x.device)
-        rotated = torch.empty_like(x_2d)
-        partial_absmax = torch.empty(
-            m, k // convrot_groupsize, dtype=torch.float32, device=x.device
-        )
+        workspace, counters = _w4a8_mma_scratch(x.device, n)
+        workspace = workspace[:m]
+        # Staged-pair scratch is only needed where the single cluster quantizer
+        # cannot run (pre-sm_90); a fused activation implies the cluster path.
+        rotated = partial_absmax = act_weight = None
+        if input_act is None and (
+            k % 256 != 0 or _cuda_device_capability(x.device.index)[0] < 9
+        ):
+            rotated = torch.empty_like(x_2d)
+            partial_absmax = torch.empty(
+                m, k // convrot_groupsize, dtype=torch.float32, device=x.device
+            )
+        if input_act == "rms_norm":
+            act_weight = _act_weight_arg(input_act, input_act_weight, x.device, x_2d.dtype)
         decode_lut = _w4a8_fixed_decode_lut(qdata.device)
-        split_k = k // 512 if k % 512 == 0 else 1
+        split_width = mma_rows * 32
+        split_k = k // split_width if k % split_width == 0 else 1
+        if _prefetch_ring.recording():
+            _record_w4a8_read_order(qdata, n, k, k // (split_k * 32))
         used = _C.w4a8_codebook_mma_linear(
             _wrap_for_dlpack(x_2d),
-            _wrap_for_dlpack(rotated),
-            _wrap_for_dlpack(partial_absmax),
+            _wrap_for_dlpack(rotated) if rotated is not None else None,
+            _wrap_for_dlpack(partial_absmax) if partial_absmax is not None else None,
+            _wrap_for_dlpack(act_weight) if act_weight is not None else None,
+            float(input_act_eps),
+            _input_act_code(input_act),
             _wrap_for_dlpack(xq),
             _wrap_for_dlpack(qdata),
             _wrap_for_dlpack(decode_lut),
@@ -2406,6 +2485,7 @@ def w4a8_int8_linear(
             _wrap_for_dlpack(xs),
             _wrap_for_dlpack(bias_float) if bias_float is not None else None,
             _wrap_for_dlpack(workspace),
+            _wrap_for_dlpack(counters),
             _wrap_for_dlpack(out),
             convrot_groupsize,
             group_size,
@@ -2419,7 +2499,7 @@ def w4a8_int8_linear(
         raise RuntimeError("MMA-packed W4A8 weight is unsupported on this device")
 
     if mma_packed:
-        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k)
+        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k, rows_per_split=mma_rows)
 
     chunked = (
         _W4A8_CHUNKED

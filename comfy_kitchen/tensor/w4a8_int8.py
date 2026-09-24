@@ -75,6 +75,7 @@ def dequantize_w4a8_int8_weight(
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
     mma_packed: bool = False,
+    mma_rows: int = 16,
 ) -> torch.Tensor:
     """Dequantize a packed W4A8 weight into its original basis."""
     kwargs = {
@@ -87,6 +88,7 @@ def dequantize_w4a8_int8_weight(
         "convrot_groupsize": convrot_groupsize,
         "output_dtype": output_dtype,
         "mma_packed": mma_packed,
+        "mma_rows": mma_rows,
     }
     impl = registry.get_implementation("dequantize_w4a8_int8_weight", kwargs=kwargs)
     return impl(**kwargs)
@@ -104,8 +106,18 @@ def w4a8_int8_linear(
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
     mma_packed: bool = False,
+    mma_rows: int = 16,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
 ) -> torch.Tensor:
-    """Compute ``x @ W.T + bias`` with the selected W4A8 backend."""
+    """Compute ``x @ W.T + bias`` with the selected W4A8 backend.
+
+    input_act ("swiglu" or "rms_norm", with input_act_weight/input_act_eps for the
+    norm) is applied to x on the way into the activation quantizer; the CUDA
+    decode path folds it into that kernel, every other path applies it eagerly
+    with identical results.
+    """
     kwargs = {
         "x": x,
         "qdata": qdata,
@@ -118,6 +130,10 @@ def w4a8_int8_linear(
         "convrot_groupsize": convrot_groupsize,
         "out_dtype": out_dtype,
         "mma_packed": mma_packed,
+        "mma_rows": mma_rows,
+        "input_act": input_act,
+        "input_act_weight": input_act_weight,
+        "input_act_eps": input_act_eps,
     }
     impl = registry.get_implementation("w4a8_int8_linear", kwargs=kwargs)
     return impl(**kwargs)
@@ -138,6 +154,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         group_size: int = 16
         convrot_groupsize: int = 256
         mma_packed: bool = False
+        mma_rows: int = 16
         transposed: bool = False
 
         def _tensor_fields(self) -> list[str]:
@@ -231,6 +248,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             convrot_groupsize=params.convrot_groupsize,
             output_dtype=params.orig_dtype,
             mma_packed=params.mma_packed,
+            mma_rows=params.mma_rows,
         )
 
     @classmethod
@@ -309,6 +327,7 @@ def _w4a8_int8_forward(
         convrot_groupsize=params.convrot_groupsize,
         out_dtype=out_dtype,
         mma_packed=params.mma_packed,
+        mma_rows=params.mma_rows,
     )
 
 

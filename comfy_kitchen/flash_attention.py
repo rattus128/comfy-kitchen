@@ -35,8 +35,8 @@ def is_available(device: torch.device | int | None = None) -> bool:
     return torch.cuda.get_device_capability(device) >= _MINIMUM_CAPABILITY
 
 
-def _num_splits(batch_heads: int, kv_capacity: int, multiprocessors: int) -> int:
-    blocks = (kv_capacity + 127) // 128
+def _num_splits(batch_heads: int, kv_capacity: int, multiprocessors: int, kv_block: int = 128) -> int:
+    blocks = (kv_capacity + kv_block - 1) // kv_block
     max_splits = min(32, multiprocessors * 2, blocks)
     best = 0.0
     efficiencies = []
@@ -112,3 +112,46 @@ def flash_attention_decode(
             torch.cuda.current_stream(q.device).cuda_stream,
         )
     return output.view(batch, groups, kv_heads, head_dim).transpose(1, 2).reshape_as(q)
+
+
+def flash_attention_decode_gqa_is_available(device: torch.device | int | None = None) -> bool:
+    """Return whether the head_dim-256 GQA decode kernel is available (CUDA extension only)."""
+    return _hip_backend is None and is_available(device) and hasattr(_cuda_backend._C, "flash_attention_decode_gqa")
+
+
+def flash_attention_decode_gqa(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_lengths: torch.Tensor
+) -> torch.Tensor:
+    """Causal GQA decode attention for BF16 q [B, H, S, 256] over k/v [B, Hk, capacity, 256].
+
+    Query row j of batch b attends cache slots < kv_lengths[b] - S + j + 1 (the MTP verify
+    staircase; S == 1 is plain decode). Returns [B, S, H*256]."""
+    batch, heads, query_length, head_dim = q.shape
+    _, kv_heads, kv_capacity, _ = k.shape
+    if not flash_attention_decode_gqa_is_available(q.device):
+        raise RuntimeError("flash_attention_decode_gqa requires the CUDA extension on SM80 or newer")
+    output = torch.empty((batch, query_length, heads * head_dim), dtype=q.dtype, device=q.device)
+    # S == 1 folds the group heads into query rows (one pass over K/V per kv head), so the
+    # kernel then runs kv_heads CTAs per split rather than heads.
+    num_splits = _num_splits(
+        batch * (kv_heads if query_length == 1 else heads),
+        kv_capacity,
+        torch.cuda.get_device_properties(q.device).multi_processor_count,
+        kv_block=64,
+    )
+    rows = batch * heads * query_length
+    softmax_lse = torch.empty(rows, dtype=torch.float32, device=q.device)
+    if num_splits > 1:
+        softmax_lse_accum = torch.empty(num_splits * rows, dtype=torch.float32, device=q.device)
+        output_accum = torch.empty(num_splits * rows * head_dim, dtype=torch.float32, device=q.device)
+    else:
+        softmax_lse_accum = output_accum = softmax_lse[:0]
+    _cuda_backend._C.flash_attention_decode_gqa(
+        *map(
+            _cuda_backend._wrap_for_dlpack,
+            (q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum),
+        ),
+        num_splits,
+        torch.cuda.current_stream(q.device).cuda_stream,
+    )
+    return output

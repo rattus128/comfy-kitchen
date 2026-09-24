@@ -16,6 +16,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
 from comfy_kitchen.backends.eager.w4a8_int8 import (
     w4a8_int8_linear as eager_w4a8_int8_linear,
 )
+from comfy_kitchen.backends._activations import apply_input_act
 from triton.language.extra import libdevice
 
 from .quantization import int8_linear
@@ -107,8 +108,13 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    mma_rows: int = 16,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
 ) -> torch.Tensor:
     """``x @ W.T + bias`` for AsymW4A8Int8 via the fused Triton dequant + INT8 GEMM."""
+    x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
     validate_w4a8_operands(
         qdata,
         s_rel,

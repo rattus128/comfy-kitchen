@@ -19,12 +19,15 @@
 
 #include "dtype_dispatch.cuh"
 #include "float_utils.cuh"
+#include "../prefetch_ring.h"
 
 // Grouped int4 -> int8 dequant for the int8-GEMM W4A8 path: out[n,k] =
 // round((q_u[n,k]-8) * s_rel[n, k/G]), q_u packed uint4 (even col=low nibble).
 // s_rel = per-group scale / per-channel scale (so the int8 range is used). The
 // per-channel scale is applied later in the int8 GEMM epilogue. Memory-bound.
 namespace {
+__device__ PrefetchRingState* g_w4a8_prefetch_ring = nullptr;
+
 // Per-group scale is fp32 or fp8 (e4m3). fp8 halves the scale metadata at a tiny
 // quality cost. uint8_t storage == e4m3 raw bits.
 template <typename ScaleT> __device__ __forceinline__ float load_scale(ScaleT v);
@@ -126,28 +129,6 @@ __device__ __forceinline__ unsigned decode_w4a8_lut4(
     return decoded;
 }
 
-__device__ __forceinline__ unsigned load_w4a8_record_scales(
-    const int8_t* record, int lane)
-{
-    const int group = lane >> 2;
-    unsigned scales = 0;
-    if ((lane & 3) == 0) {
-        scales = reinterpret_cast<const unsigned*>(record + 256)[group];
-    }
-    return __shfl_sync(0xffffffffu, scales, group * 4);
-}
-
-__device__ __forceinline__ void decode_w4a8_record(
-    const uint2& packed, unsigned scales,
-    const int8_t* __restrict__ decode_lut, unsigned (&decoded)[4])
-{
-    decoded[0] = decode_w4a8_lut4(packed.x & 0xffffu, scales & 0xffu, decode_lut);
-    decoded[1] = decode_w4a8_lut4(packed.x >> 16, (scales >> 8) & 0xffu, decode_lut);
-    decoded[2] = decode_w4a8_lut4(
-        packed.y & 0xffffu, (scales >> 16) & 0xffu, decode_lut);
-    decoded[3] = decode_w4a8_lut4(packed.y >> 16, scales >> 24, decode_lut);
-}
-
 __device__ __forceinline__ void mma_m16n8k32_s8(
     int (&acc)[4], const unsigned (&a)[4], const unsigned (&b)[2])
 {
@@ -183,13 +164,17 @@ __global__ void w4a8_codebook_mma_kernel(
     const int thread_in_group = lane & 3;
     const int n0 = (static_cast<int>(blockIdx.x) * WarpsPerBlock + warp) * 16;
     const int k_per_split = K / split_k;
-    const int k_begin = static_cast<int>(blockIdx.y) * k_per_split;
+    const int split = static_cast<int>(blockIdx.y);
+    const int k_begin = split * k_per_split;
     const int k_end = k_begin + k_per_split;
+    const int tiles = (N + 15) / 16;
+    const int64_t first_record =
+        (static_cast<int64_t>(split) * tiles + n0 / 16) * (k_per_split / 32);
 
     int acc[4] = {};
     for (int k0 = k_begin; k0 < k_end; k0 += 32) {
         const int k_lane = thread_in_group * 4;
-        const int64_t tile = static_cast<int64_t>(n0 / 16) * (K / 32) + k0 / 32;
+        const int64_t tile = first_record + (k0 - k_begin) / 32;
         const int8_t* __restrict__ tile_data = weight + tile * 288;
         const uint2 packed = reinterpret_cast<const uint2*>(tile_data)[lane];
         unsigned scales = 0;
@@ -212,6 +197,13 @@ __global__ void w4a8_codebook_mma_kernel(
             x4 ? static_cast<unsigned>(x4[(k0 + k_lane + 16) / 4]) : 0u,
         };
         mma_m16n8k32_s8(acc, a, b);
+    }
+    // Ring consumption: one add per block for the records its warps streamed.
+    if (threadIdx.x == 0) {
+        const int block_tiles = min(WarpsPerBlock, tiles - static_cast<int>(blockIdx.x) * WarpsPerBlock);
+        prefetch_ring_consume_device(
+            g_w4a8_prefetch_ring,
+            static_cast<uint64_t>(block_tiles) * (k_per_split / 32) * 288);
     }
 
     const int token0 = thread_in_group * 2;
@@ -236,98 +228,260 @@ __global__ void w4a8_codebook_mma_kernel(
     }
 }
 
-// The Qwen decode schedule uses 16 consecutive K records per split. Peeling two
-// records at a time keeps the following record load in flight while the current
-// pair is decoded and consumed by MMA.
-template <int WarpsPerBlock>
+// Decode one 16-code chunk (one scale byte) with the LUT row for that scale held in
+// shared memory: two byte permutes pick codes 0-7 / 8-15, code bit 3 selects between
+// them. Same LUT bytes as decode_w4a8_lut4, so the result is bit-identical.
+__device__ __forceinline__ unsigned decode_w4a8_chunk(
+    unsigned codes, unsigned scale_bits, const uint4* __restrict__ lut)
+{
+    const uint4 table = lut[scale_bits];
+    // selector nibbles use bits 0-2 only; bit 3 of each code then picks lo/hi per byte
+    const unsigned lo = __byte_perm(table.x, table.y, codes);
+    const unsigned hi = __byte_perm(table.z, table.w, codes);
+    return __byte_perm(lo, hi, ((codes >> 1) & 0x4444u) | 0x3210u);
+}
+
+__device__ __forceinline__ void decode_w4a8_record_smem(
+    const uint2& packed, unsigned scales,
+    const uint4* __restrict__ lut, unsigned (&decoded)[4])
+{
+    decoded[0] = decode_w4a8_chunk(packed.x, scales & 0xffu, lut);
+    decoded[1] = decode_w4a8_chunk(packed.x >> 16, (scales >> 8) & 0xffu, lut);
+    decoded[2] = decode_w4a8_chunk(packed.y, (scales >> 16) & 0xffu, lut);
+    decoded[3] = decode_w4a8_chunk(packed.y >> 16, scales >> 24, lut);
+}
+
+__device__ __forceinline__ void cp_async16_evict_first(uint32_t smem, const void* gptr) {
+#ifdef W4A8_NO_EVICT_FIRST
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(gptr));
+#else
+    // Weights are read once per step: evict_first keeps the demand stream from
+    // displacing lines the prefetch ring already landed; ring-prefetched lines
+    // (inserted with the default priority) still hit.
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
+                 :: "r"(smem), "l"(gptr), "l"(policy));
+#endif
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N> __device__ __forceinline__ void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+// Streaming decode GEMM for the Qwen schedule. A warp owns one 16-output tile over
+// `rows` consecutive K records and streams them through a Stages-deep per-warp
+// cp.async ring in shared memory: one record is decoded + MMA'd while Stages-1 are
+// in flight, for the warp's whole life. Register rings can't do this: ptxas gives
+// every load in the loop one scoreboard, so waiting on one record waits on all.
+//
+// Weight layout is the checkpoint's split-major packing with PackRows records per
+// (split, tile): record for K-row `krow` of `tile` lives at
+// ((krow / PackRows) * tiles + tile) * PackRows + krow % PackRows. `rows` is
+// decoupled from PackRows (chosen by the launcher for occupancy), so a warp's
+// records are rows/PackRows runs of PackRows*288 contiguous bytes.
+//
+// LUT and the block's x slice are staged in shared memory after the first loads are
+// issued. The split-K reduction finishes in-kernel: each warp adds its tile into the
+// int32 workspace, bumps the tile's counter, and the warp that arrives last reads
+// the tile back from L2, applies the scales/bias, writes the output, and returns
+// the workspace tile and counter to zero. So the workspace and counters are zero
+// on entry and on exit, and the caller keeps them across launches.
+#ifndef W4A8_STREAM_STAGES
+#define W4A8_STREAM_STAGES 4
+#endif
+constexpr int kStreamStages = W4A8_STREAM_STAGES;
+constexpr int kStreamMaxRows = 32;
+
+__host__ __device__ constexpr int w4a8_stream_smem_bytes(int warps_per_block, int rows) {
+    return 4096 + 8 * (rows * 32 + 16) + warps_per_block * kStreamStages * 288;
+}
+
+#ifdef W4A8_BLOCK_TRACE
+// Diagnostic only (harness builds): per-block smid and globaltimer start/end of the stream kernel.
+struct W4A8BlockTrace { unsigned sm, pad; unsigned long long t0, t1; };
+__device__ W4A8BlockTrace* g_w4a8_block_trace = nullptr;
+#define W4A8_TRACE_BEGIN() unsigned long long _tr_t0 = 0; unsigned _tr_sm = 0; \
+    if (threadIdx.x == 0 && g_w4a8_block_trace) { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_tr_t0)); asm("mov.u32 %0, %%smid;" : "=r"(_tr_sm)); }
+#define W4A8_TRACE_END() if (threadIdx.x == 0 && g_w4a8_block_trace) { unsigned long long _t1; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_t1)); \
+    W4A8BlockTrace& r = g_w4a8_block_trace[blockIdx.y * gridDim.x + blockIdx.x]; r.sm = _tr_sm; r.t0 = _tr_t0; r.t1 = _t1; }
+#else
+#define W4A8_TRACE_BEGIN()
+#define W4A8_TRACE_END()
+#endif
+
+template <int WarpsPerBlock, int PackRows, typename OutputT>
 __global__ __launch_bounds__(WarpsPerBlock * 32)
-void w4a8_codebook_mma_16_kernel(
+void w4a8_codebook_mma_stream_kernel(
     const int8_t* __restrict__ x,
     const int8_t* __restrict__ weight,
     const int8_t* __restrict__ decode_lut,
+    const float* __restrict__ s_channel,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ bias,
     int* __restrict__ workspace,
-    int M, int N, int K)
+    int* __restrict__ counters,
+    OutputT* __restrict__ output,
+    int M, int N, int K, int rows)
 {
-    constexpr int RowsPerWarp = 16;
-    const int lane = threadIdx.x & 31;
-    const int output_tile = static_cast<int>(blockIdx.x) * WarpsPerBlock
-                          + (threadIdx.x >> 5);
-    if (output_tile >= N / 16) return;
+    constexpr int S = kStreamStages;
+    W4A8_TRACE_BEGIN();
+    extern __shared__ __align__(16) uint8_t smem[];
+    uint4* lut = reinterpret_cast<uint4*>(smem);
+    uint8_t* xs_s = smem + 4096;
+    const int x_stride = rows * 32 + 16;   // +16 keeps the per-token rows off one bank pattern
+    uint8_t* stages = xs_s + 8 * x_stride;
 
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int tiles = N / 16;
+    const int output_tile = static_cast<int>(blockIdx.x) * WarpsPerBlock + warp;
+    const bool active = output_tile < tiles;
     const int split = static_cast<int>(blockIdx.y);
-    const int k_begin = split * RowsPerWarp * 32;
-    const int64_t first_record = static_cast<int64_t>(output_tile) * (K / 32)
-                               + split * RowsPerWarp;
-    const int8_t* row = weight + first_record * 288;
-    uint2 ping = reinterpret_cast<const uint2*>(row)[lane];
-    unsigned ping_scales = load_w4a8_record_scales(row, lane);
-    int acc[4] = {};
+    const int k_begin = split * rows * 32;
+
+    // lanes 0..17 each move 16 B of the 288 B record
+    const int8_t* tile_base = weight
+        + static_cast<int64_t>(output_tile) * PackRows * 288 + lane * 16;
+    const int64_t chunk_stride = static_cast<int64_t>(tiles) * PackRows * 288;
+    auto record = [&](int i) -> const int8_t* {
+        const int krow = split * rows + i;
+        return tile_base + (krow / PackRows) * chunk_stride + (krow % PackRows) * 288;
+    };
+    const bool issuer = active && lane < 18;
+    const uint8_t* my_stages = stages + warp * S * 288;
+    const uint32_t st_s = static_cast<uint32_t>(__cvta_generic_to_shared(my_stages)) + lane * 16;
+
+    // Ring consumption: thread 0 credits the block's PackRows*288-byte runs as
+    // its own loads of them complete (sibling warps stream in lockstep, so the
+    // error is < 1 block). The ring's byte stream is the host-recorded chunk
+    // order, k outer and split inner (w4a8_stream_chunks), and every block of
+    // a wave passes each run boundary at about the same time, so the credited
+    // total tracks the stream position.
+    const uint64_t run_credit = static_cast<uint64_t>(
+        min(WarpsPerBlock, tiles - static_cast<int>(blockIdx.x) * WarpsPerBlock)) * PackRows * 288;
+    auto credit = [&](int i) {
+        if (threadIdx.x == 0 && ((i + 1) & (PackRows - 1)) == 0)
+            prefetch_ring_consume_device(g_w4a8_prefetch_ring, run_credit);
+    };
+
+    #pragma unroll
+    for (int s = 0; s < S; ++s) {
+        if (issuer) cp_async16_evict_first(st_s + s * 288, record(s));
+        cp_async_commit();
+    }
+#ifdef W4A8_SELF_PREFETCH
+    // Pull the warp's later runs into L2 now so the demand stream above hits.
+    // Each run is PackRows contiguous records; run 0 is already in flight.
+    if (active && lane == 0) {
+        for (int r = PackRows; r < rows; r += PackRows) {
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                         :: "l"(record(r)), "r"(static_cast<unsigned>(PackRows * 288)) : "memory");
+        }
+    }
+#endif
+    for (int i = threadIdx.x; i < 256; i += WarpsPerBlock * 32) {
+        lut[i] = reinterpret_cast<const uint4*>(decode_lut)[i];
+    }
+    for (int i = threadIdx.x; i < 8 * rows * 2; i += WarpsPerBlock * 32) {
+        const int token = i / (rows * 2), v = i % (rows * 2);
+        uint4 value = make_uint4(0u, 0u, 0u, 0u);
+        if (token < M) {
+            value = reinterpret_cast<const uint4*>(x + static_cast<int64_t>(token) * K + k_begin)[v];
+        }
+        *reinterpret_cast<uint4*>(xs_s + token * x_stride + v * 16) = value;
+    }
+    __syncthreads();
+    if (!active) return;
 
     const int token = lane >> 2;
-    const int k_lane = (lane & 3) * 4;
-    const int* x4 = token < M
-        ? reinterpret_cast<const int*>(x + static_cast<int64_t>(token) * K)
-        : nullptr;
+    const int thread_in_group = lane & 3;
+    const uint8_t* xrow = xs_s + token * x_stride + thread_in_group * 4;
+    const uint8_t* rec_codes = my_stages + lane * 8;
+    const uint8_t* rec_scales = my_stages + 256 + token * 4;
+    int acc[4] = {};
 
-    #pragma unroll 1
-    for (int i = 1; i < RowsPerWarp - 1; i += 2) {
-        const int8_t* pong_row = row + i * 288;
-        const uint2 pong = reinterpret_cast<const uint2*>(pong_row)[lane];
-        const unsigned pong_scales = load_w4a8_record_scales(pong_row, lane);
+    auto consume = [&](int stage, int i) {
+        const uint2 packed = *reinterpret_cast<const uint2*>(rec_codes + stage * 288);
+        const unsigned scales = *reinterpret_cast<const unsigned*>(rec_scales + stage * 288);
         unsigned decoded[4];
-        decode_w4a8_record(ping, ping_scales, decode_lut, decoded);
-
-        const int8_t* next_ping_row = pong_row + 288;
-        ping = reinterpret_cast<const uint2*>(next_ping_row)[lane];
-        ping_scales = load_w4a8_record_scales(next_ping_row, lane);
-        int k0 = k_begin + (i - 1) * 32;
-        const unsigned ping_input[2] = {
-            x4 ? static_cast<unsigned>(x4[(k0 + k_lane) / 4]) : 0u,
-            x4 ? static_cast<unsigned>(x4[(k0 + k_lane + 16) / 4]) : 0u,
+        decode_w4a8_record_smem(packed, scales, lut, decoded);
+        const unsigned input[2] = {
+            *reinterpret_cast<const unsigned*>(xrow + i * 32),
+            *reinterpret_cast<const unsigned*>(xrow + i * 32 + 16),
         };
-        mma_m16n8k32_s8(acc, decoded, ping_input);
+        mma_m16n8k32_s8(acc, decoded, input);
+    };
 
-        decode_w4a8_record(pong, pong_scales, decode_lut, decoded);
-        k0 += 32;
-        const unsigned pong_input[2] = {
-            x4 ? static_cast<unsigned>(x4[(k0 + k_lane) / 4]) : 0u,
-            x4 ? static_cast<unsigned>(x4[(k0 + k_lane + 16) / 4]) : 0u,
-        };
-        mma_m16n8k32_s8(acc, decoded, pong_input);
+    // Record i is consumed once at most S-1 newer groups are pending, then its stage
+    // is refilled with record i+S. Unrolled by S so stage indices are compile-time.
+    int i = 0;
+    for (; i + S <= rows - S; i += S) {
+        #pragma unroll
+        for (int j = 0; j < S; ++j) {
+            cp_async_wait<S - 1>();
+            __syncwarp();
+            consume(j, i + j);
+            credit(i + j);
+            __syncwarp();
+            if (issuer) cp_async16_evict_first(st_s + j * 288, record(i + S + j));
+            cp_async_commit();
+        }
+    }
+    for (; i < rows; ++i) {
+        cp_async_wait<S - 1>();
+        __syncwarp();
+        consume(i % S, i);
+        credit(i);
+        __syncwarp();
+        if (issuer && i + S < rows) cp_async16_evict_first(st_s + (i % S) * 288, record(i + S));
+        cp_async_commit();
     }
 
-    const int8_t* pong_row = row + (RowsPerWarp - 1) * 288;
-    const uint2 pong = reinterpret_cast<const uint2*>(pong_row)[lane];
-    const unsigned pong_scales = load_w4a8_record_scales(pong_row, lane);
-    unsigned decoded[4];
-    decode_w4a8_record(ping, ping_scales, decode_lut, decoded);
-    int k0 = k_begin + (RowsPerWarp - 2) * 32;
-    const unsigned ping_input[2] = {
-        x4 ? static_cast<unsigned>(x4[(k0 + k_lane) / 4]) : 0u,
-        x4 ? static_cast<unsigned>(x4[(k0 + k_lane + 16) / 4]) : 0u,
-    };
-    mma_m16n8k32_s8(acc, decoded, ping_input);
-    decode_w4a8_record(pong, pong_scales, decode_lut, decoded);
-    k0 += 32;
-    const unsigned pong_input[2] = {
-        x4 ? static_cast<unsigned>(x4[(k0 + k_lane) / 4]) : 0u,
-        x4 ? static_cast<unsigned>(x4[(k0 + k_lane + 16) / 4]) : 0u,
-    };
-    mma_m16n8k32_s8(acc, decoded, pong_input);
-
-    const int thread_in_group = lane & 3;
     const int token0 = thread_in_group * 2;
     const int token1 = token0 + 1;
-    const int n_top = output_tile * 16 + (lane >> 2);
+    const int n_top = output_tile * 16 + token;
     const int n_bottom = n_top + 8;
+    int* ws00 = &workspace[static_cast<int64_t>(token0) * N + n_top];
+    int* ws01 = &workspace[static_cast<int64_t>(token0) * N + n_bottom];
+    int* ws10 = &workspace[static_cast<int64_t>(token1) * N + n_top];
+    int* ws11 = &workspace[static_cast<int64_t>(token1) * N + n_bottom];
     if (token0 < M) {
-        atomicAdd(&workspace[static_cast<int64_t>(token0) * N + n_top], acc[0]);
-        atomicAdd(&workspace[static_cast<int64_t>(token0) * N + n_bottom], acc[2]);
+        atomicAdd(ws00, acc[0]);
+        atomicAdd(ws01, acc[2]);
     }
     if (token1 < M) {
-        atomicAdd(&workspace[static_cast<int64_t>(token1) * N + n_top], acc[1]);
-        atomicAdd(&workspace[static_cast<int64_t>(token1) * N + n_bottom], acc[3]);
+        atomicAdd(ws10, acc[1]);
+        atomicAdd(ws11, acc[3]);
     }
+
+    // Publish this warp's adds, then arrive on the tile counter. The lane that sees
+    // split_k-1 prior arrivals knows every split's adds are visible at L2.
+    __threadfence();
+    W4A8_TRACE_END();
+    int prior = 0;
+    if (lane == 0) prior = atomicAdd(&counters[output_tile], 1);
+    prior = __shfl_sync(0xffffffffu, prior, 0);
+    if (prior != static_cast<int>(gridDim.y) - 1) return;
+    __threadfence();
+
+    // Same lane->element mapping as the adds above, so the warp covers the whole
+    // [M, 16] tile exactly once: read (L2), scale, store, and re-zero.
+    auto finish = [&](int* ws, int tok, int n) {
+        float value = static_cast<float>(__ldcg(ws)) * x_scales[tok] * s_channel[n];
+        if (bias) value += bias[n];
+        output[static_cast<int64_t>(tok) * N + n] = store_output<OutputT>(value);
+        *ws = 0;
+    };
+    if (token0 < M) {
+        finish(ws00, token0, n_top);
+        finish(ws01, token0, n_bottom);
+    }
+    if (token1 < M) {
+        finish(ws10, token1, n_top);
+        finish(ws11, token1, n_bottom);
+    }
+    if (lane == 0) counters[output_tile] = 0;
 }
 
 template <typename OutputT>
@@ -348,6 +502,10 @@ __global__ void w4a8_codebook_mma_epilogue(
     output[index] = store_output<OutputT>(value);
 }
 }  // namespace
+
+extern "C" void set_w4a8_prefetch_ring_state(PrefetchRingState* state) {
+    cudaMemcpyToSymbol(g_w4a8_prefetch_ring, &state, sizeof(state));
+}
 
 // codebook: 16 floats (non-uniform levels) or nullptr for uniform (q-8).
 extern "C" void launch_dequant_int4_grouped_to_int8(
@@ -425,11 +583,33 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     return true;
 }
 
+// Rows per warp the streaming kernel uses for an [N, K] weight packed with
+// pack_rows records per split, or 0 when the generic kernel runs instead: the
+// largest rows dividing K/32 that still fills about one wave of warps (halving
+// otherwise), so small matrices (o_proj) do not run under-occupied. Exported so
+// the host can record the kernel's read order for the prefetch ring.
+extern "C" int w4a8_stream_rows(int64_t N, int64_t K, int64_t pack_rows) {
+    if (N % 16 != 0 || (pack_rows != 8 && pack_rows != 16) || K % (pack_rows * 32) != 0) return 0;
+    int device = 0, sm_count = 0;
+    if (cudaGetDevice(&device) != cudaSuccess
+            || cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+        return 0;
+    const int64_t k_rows = K / 32;
+    const int64_t tiles = N / 16;
+    const int64_t wave = static_cast<int64_t>(sm_count) * 20;
+    int rows = kStreamMaxRows;
+    while (rows > pack_rows && (k_rows % rows != 0 || tiles * (k_rows / rows) < wave)) rows /= 2;
+    return rows;
+}
+
+// workspace [M, N] int32 and counters [N/16] int32 must be zero on entry; the streaming
+// kernel leaves them zero, and the generic kernel re-zeroes the workspace after its
+// epilogue, so the caller can keep both across launches.
 extern "C" bool launch_w4a8_codebook_mma(
     const void* xq, const void* weight, const void* decode_lut,
     const void* s_channel, const void* xs, const void* bias, void* workspace,
-    void* out, int64_t M, int64_t N, int64_t K, int64_t G, int64_t split_k,
-    int64_t warps_per_block, int out_dtype_code, cudaStream_t stream)
+    void* counters, void* out, int64_t M, int64_t N, int64_t K, int64_t G,
+    int64_t split_k, int64_t warps_per_block, int out_dtype_code, cudaStream_t stream)
 {
     if (M == 0 || N == 0 || K == 0) return true;
     if (M > 8 || decode_lut == nullptr || N > std::numeric_limits<int>::max()
@@ -448,20 +628,36 @@ extern "C" bool launch_w4a8_codebook_mma(
             || compute_capability_major < 8) {
         return false;
     }
-    cudaMemsetAsync(workspace, 0, M * N * sizeof(int), stream);
+    // split_k from the caller describes the weight packing (PackRows records per
+    // split); the streaming kernel picks its own rows per warp for occupancy.
+    const int pack_rows = static_cast<int>(K) / static_cast<int>(split_k * 32);
+    const int rows = w4a8_stream_rows(N, K, pack_rows);
+    const bool streamed = rows != 0;
+    const int k_rows = static_cast<int>(K) / 32;
     auto launch = [&]<int WarpsPerBlock>() {
         constexpr int OutputsPerBlock = WarpsPerBlock * 16;
         const dim3 grid(
             static_cast<unsigned int>((N + OutputsPerBlock - 1) / OutputsPerBlock),
-            static_cast<unsigned int>(split_k));
-        if (N % 16 == 0 && K == split_k * 16 * 32) {
-            w4a8_codebook_mma_16_kernel<WarpsPerBlock>
-                <<<grid, WarpsPerBlock * 32, 0, stream>>>(
-                static_cast<const int8_t*>(xq),
-                static_cast<const int8_t*>(weight),
-                static_cast<const int8_t*>(decode_lut),
-                static_cast<int*>(workspace),
-                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
+            static_cast<unsigned int>(streamed ? k_rows / rows : split_k));
+        if (streamed) {
+            DISPATCH_FP_DTYPE(out_dtype_code, OutputT, [&] {
+                auto launch_stream = [&]<int PackRows>() {
+                    w4a8_codebook_mma_stream_kernel<WarpsPerBlock, PackRows, OutputT>
+                        <<<grid, WarpsPerBlock * 32, w4a8_stream_smem_bytes(WarpsPerBlock, rows), stream>>>(
+                        static_cast<const int8_t*>(xq),
+                        static_cast<const int8_t*>(weight),
+                        static_cast<const int8_t*>(decode_lut),
+                        static_cast<const float*>(s_channel),
+                        static_cast<const float*>(xs),
+                        static_cast<const float*>(bias),
+                        static_cast<int*>(workspace),
+                        static_cast<int*>(counters),
+                        static_cast<OutputT*>(out),
+                        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), rows);
+                };
+                if (pack_rows == 8) launch_stream.template operator()<8>();
+                else launch_stream.template operator()<16>();
+            });
         } else {
             w4a8_codebook_mma_kernel<WarpsPerBlock>
                 <<<grid, WarpsPerBlock * 32, 0, stream>>>(
@@ -479,15 +675,18 @@ extern "C" bool launch_w4a8_codebook_mma(
         case 4: launch.template operator()<4>(); break;
         case 8: launch.template operator()<8>(); break;
     }
-    constexpr int EpilogueThreads = 256;
-    const int epilogue_blocks = static_cast<int>((M * N + EpilogueThreads - 1) / EpilogueThreads);
-    DISPATCH_FP_DTYPE(out_dtype_code, OutputT, [&] {
-        w4a8_codebook_mma_epilogue<OutputT><<<epilogue_blocks, EpilogueThreads, 0, stream>>>(
-            static_cast<const int*>(workspace),
-            static_cast<const float*>(s_channel), static_cast<const float*>(xs),
-            static_cast<const float*>(bias), static_cast<OutputT*>(out),
-            static_cast<int>(M), static_cast<int>(N));
-    });
+    if (!streamed) {
+        constexpr int EpilogueThreads = 256;
+        const int epilogue_blocks = static_cast<int>((M * N + EpilogueThreads - 1) / EpilogueThreads);
+        DISPATCH_FP_DTYPE(out_dtype_code, OutputT, [&] {
+            w4a8_codebook_mma_epilogue<OutputT><<<epilogue_blocks, EpilogueThreads, 0, stream>>>(
+                static_cast<const int*>(workspace),
+                static_cast<const float*>(s_channel), static_cast<const float*>(xs),
+                static_cast<const float*>(bias), static_cast<OutputT*>(out),
+                static_cast<int>(M), static_cast<int>(N));
+        });
+        cudaMemsetAsync(workspace, 0, M * N * sizeof(int), stream);
+    }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string("W4A8 packed MMA failed: ") + cudaGetErrorString(error));
