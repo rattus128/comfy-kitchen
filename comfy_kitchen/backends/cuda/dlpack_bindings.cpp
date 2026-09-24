@@ -4690,12 +4690,12 @@ NB_MODULE(_C, m) {
           nb::arg("x"), nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
           nb::arg("qkv_buf"), nb::arg("gates_buf"), nb::arg("sumsq_buf"), nb::arg("ctl"),
           nb::arg("state"), nb::arg("out"), nb::arg("z"), nb::arg("norm_w"), nb::arg("eps"),
-          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("stream_ptr"));
+          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("tree"), nb::arg("stream_ptr"));
 
     m.def("deltanet_conv_deferred", &deltanet_conv_deferred,
           "Depthwise causal conv decode step with silu; commits the previous step's accepted window first",
           nb::arg("proj"), nb::arg("proj_buf"), nb::arg("conv_state"), nb::arg("conv_w"), nb::arg("conv_b") = nb::none(),
-          nb::arg("qkv_buf"), nb::arg("ctl"), nb::arg("stream_ptr"));
+          nb::arg("qkv_buf"), nb::arg("ctl"), nb::arg("tree"), nb::arg("stream_ptr"));
 
     m.def("sol_attn_plan", &sol_attn_plan_py,
           "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
