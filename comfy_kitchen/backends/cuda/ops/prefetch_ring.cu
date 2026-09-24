@@ -18,10 +18,7 @@ constexpr int kIssuers = PREFETCH_RING_ISSUERS;
 #define PREFETCH_RING_ISSUER_CARVEOUT cudaSharedmemCarveoutMaxShared
 #endif
 constexpr int kIssuerThreads = 32;
-#ifndef PREFETCH_RING_ISSUE_BATCH
-#define PREFETCH_RING_ISSUE_BATCH 8
-#endif
-constexpr int kIssueBatch = PREFETCH_RING_ISSUE_BATCH;   // chunks issued per consumed-snapshot
+constexpr int kIssueBatch = 8;   // chunks issued per consumed-snapshot
 PrefetchRingState* g_states[16] = {};
 cudaStream_t g_issue_streams[16] = {};
 cudaEvent_t g_start_events[16] = {};
@@ -102,19 +99,8 @@ struct RingCursor {
         while (n != 0) {
             const uint64_t avail = bytes - offset;
             const uint64_t step = n < avail ? n : avail;
-#ifdef PREFETCH_RING_EVICT_LAST
-            // Ring lines are consumed oldest-first, so plain LRU evicts exactly the
-            // lines needed next whenever other traffic (recurrent state, KV,
-            // activations) streams through L2. evict_last keeps them until the
-            // consumer's evict_first access demotes them.
-            uint64_t policy;
-            asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
-            asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;"
-                         :: "l"(base + offset), "r"(static_cast<unsigned>(step)), "l"(policy) : "memory");
-#else
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
                          :: "l"(base + offset), "r"(static_cast<unsigned>(step)) : "memory");
-#endif
             n -= step;
             offset += step;
             if (offset == bytes) next_region();
@@ -132,15 +118,6 @@ struct RingCursor {
 // the previous chunk issued, so the fast path has no load latency in it; a
 // stale snapshot only delays a skip or a window advance by one chunk. The
 // counters are polled synchronously only while the window is exhausted.
-#ifdef RING_TRACE
-// Diagnostic only (harness builds): CTA 0 logs (globaltimer, cursor, consumed, waiting) per loop iteration.
-struct RingTraceRec { uint64_t t, cursor, consumed; uint32_t waiting, cta; };
-__device__ RingTraceRec* g_ring_trace = nullptr;
-__device__ unsigned g_ring_trace_n = 0, g_ring_trace_cap = 0;
-#define RING_TRACE_REC(w) do { if (g_ring_trace) { unsigned k = atomicAdd(&g_ring_trace_n, 1u); if (k < g_ring_trace_cap) g_ring_trace[k] = RingTraceRec{global_timer(), cursor, consumed, (w), blockIdx.x}; } } while (0)
-#else
-#define RING_TRACE_REC(w) do {} while (0)
-#endif
 
 __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(PrefetchRingState* ring) {
     if (threadIdx.x != 0) return;
@@ -186,7 +163,6 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
         }
         if (cursor >= consumed + lookahead) {
             const uint64_t t0 = global_timer();
-            RING_TRACE_REC(1u);
             do {
                 __nanosleep(256);
                 waited += 256;
@@ -210,7 +186,6 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
         const int next_enabled = *enabled_p;
         const uint64_t cap = consumed + lookahead < end + lookahead ? consumed + lookahead : end + lookahead;
         for (int k = 0; k < kIssueBatch && cursor < cap; ++k) {
-            RING_TRACE_REC(0u);
             pos.prefetch(chunk);
             touched += chunk;
             pos.advance(stride - chunk);
@@ -224,15 +199,6 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
     atomicAdd(reinterpret_cast<unsigned long long*>(&ring->waited_ns), waited);
 }
 
-} // namespace
-#ifdef RING_TRACE
-extern "C" void prefetch_ring_set_trace(void* buf, unsigned cap) {
-    RingTraceRec* p = static_cast<RingTraceRec*>(buf); unsigned zero = 0;
-    cudaMemcpyToSymbol(g_ring_trace, &p, sizeof(p)); cudaMemcpyToSymbol(g_ring_trace_cap, &cap, 4); cudaMemcpyToSymbol(g_ring_trace_n, &zero, 4);
-}
-extern "C" unsigned prefetch_ring_trace_count() { unsigned n; cudaMemcpyFromSymbol(&n, g_ring_trace_n, 4); return n; }
-#endif
-namespace {
 
 PrefetchRingState* current_state(int* device_out) {
     int device = 0;

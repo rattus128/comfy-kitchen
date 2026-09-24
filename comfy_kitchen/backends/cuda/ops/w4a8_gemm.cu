@@ -252,9 +252,6 @@ __device__ __forceinline__ void decode_w4a8_record_smem(
 }
 
 __device__ __forceinline__ void cp_async16_evict_first(uint32_t smem, const void* gptr) {
-#ifdef W4A8_NO_EVICT_FIRST
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(gptr));
-#else
     // Weights are read once per step: evict_first keeps the demand stream from
     // displacing lines the prefetch ring already landed; ring-prefetched lines
     // (inserted with the default priority) still hit.
@@ -262,7 +259,6 @@ __device__ __forceinline__ void cp_async16_evict_first(uint32_t smem, const void
     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
                  :: "r"(smem), "l"(gptr), "l"(policy));
-#endif
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
 template <int N> __device__ __forceinline__ void cp_async_wait() {
@@ -287,28 +283,13 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
 // the tile back from L2, applies the scales/bias, writes the output, and returns
 // the workspace tile and counter to zero. So the workspace and counters are zero
 // on entry and on exit, and the caller keeps them across launches.
-#ifndef W4A8_STREAM_STAGES
-#define W4A8_STREAM_STAGES 4
-#endif
-constexpr int kStreamStages = W4A8_STREAM_STAGES;
+constexpr int kStreamStages = 4;
 constexpr int kStreamMaxRows = 32;
 
 __host__ __device__ constexpr int w4a8_stream_smem_bytes(int warps_per_block, int rows) {
     return 4096 + 8 * (rows * 32 + 16) + warps_per_block * kStreamStages * 288;
 }
 
-#ifdef W4A8_BLOCK_TRACE
-// Diagnostic only (harness builds): per-block smid and globaltimer start/end of the stream kernel.
-struct W4A8BlockTrace { unsigned sm, pad; unsigned long long t0, t1; };
-__device__ W4A8BlockTrace* g_w4a8_block_trace = nullptr;
-#define W4A8_TRACE_BEGIN() unsigned long long _tr_t0 = 0; unsigned _tr_sm = 0; \
-    if (threadIdx.x == 0 && g_w4a8_block_trace) { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_tr_t0)); asm("mov.u32 %0, %%smid;" : "=r"(_tr_sm)); }
-#define W4A8_TRACE_END() if (threadIdx.x == 0 && g_w4a8_block_trace) { unsigned long long _t1; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_t1)); \
-    W4A8BlockTrace& r = g_w4a8_block_trace[blockIdx.y * gridDim.x + blockIdx.x]; r.sm = _tr_sm; r.t0 = _tr_t0; r.t1 = _t1; }
-#else
-#define W4A8_TRACE_BEGIN()
-#define W4A8_TRACE_END()
-#endif
 
 template <int WarpsPerBlock, int PackRows, typename OutputT>
 __global__ __launch_bounds__(WarpsPerBlock * 32)
@@ -325,7 +306,6 @@ void w4a8_codebook_mma_stream_kernel(
     int M, int N, int K, int rows)
 {
     constexpr int S = kStreamStages;
-    W4A8_TRACE_BEGIN();
     extern __shared__ __align__(16) uint8_t smem[];
     uint4* lut = reinterpret_cast<uint4*>(smem);
     uint8_t* xs_s = smem + 4096;
@@ -370,16 +350,6 @@ void w4a8_codebook_mma_stream_kernel(
         if (issuer) cp_async16_evict_first(st_s + s * 288, record(s));
         cp_async_commit();
     }
-#ifdef W4A8_SELF_PREFETCH
-    // Pull the warp's later runs into L2 now so the demand stream above hits.
-    // Each run is PackRows contiguous records; run 0 is already in flight.
-    if (active && lane == 0) {
-        for (int r = PackRows; r < rows; r += PackRows) {
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
-                         :: "l"(record(r)), "r"(static_cast<unsigned>(PackRows * 288)) : "memory");
-        }
-    }
-#endif
     for (int i = threadIdx.x; i < 256; i += WarpsPerBlock * 32) {
         lut[i] = reinterpret_cast<const uint4*>(decode_lut)[i];
     }
@@ -458,7 +428,6 @@ void w4a8_codebook_mma_stream_kernel(
     // Publish this warp's adds, then arrive on the tile counter. The lane that sees
     // split_k-1 prior arrivals knows every split's adds are visible at L2.
     __threadfence();
-    W4A8_TRACE_END();
     int prior = 0;
     if (lane == 0) prior = atomicAdd(&counters[output_tile], 1);
     prior = __shfl_sync(0xffffffffu, prior, 0);
