@@ -2307,7 +2307,7 @@ extern "C" {
 
     void launch_flash_decode_tree_merge(
         const void* out, const float* lse, const void* q, const void* k, const void* v, const int* mask, void* merged,
-        int batch, int rows, int heads, int kv_heads,
+        int batch, int rows, int kv_rows, int heads, int kv_heads,
         int64_t q_batch_stride, int64_t q_head_stride, int64_t q_row_stride,
         int64_t k_batch_stride, int64_t k_head_stride, int64_t k_row_stride,
         int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
@@ -4016,10 +4016,10 @@ void flash_attention_decode_tree_merge(
     uintptr_t stream_ptr) {
     constexpr int64_t kHeadDim = 256;
     const int64_t batch = q.shape(0), heads = q.shape(1), rows = q.shape(2);
-    const int64_t kv_heads = k.shape(1);
-    if (batch <= 0 || heads <= 0 || rows <= 0 || rows > 8 || kv_heads <= 0 || heads % kv_heads != 0
-        || q.shape(3) != kHeadDim || k.shape(0) != batch || k.shape(2) != rows || k.shape(3) != kHeadDim
-        || v.shape(0) != batch || v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim
+    const int64_t kv_heads = k.shape(1), kv_rows = k.shape(2);
+    if (batch <= 0 || heads <= 0 || rows <= 0 || rows > 8 || kv_rows <= 0 || kv_rows > 8 || kv_heads <= 0 || heads % kv_heads != 0
+        || q.shape(3) != kHeadDim || k.shape(0) != batch || k.shape(3) != kHeadDim
+        || v.shape(0) != batch || v.shape(1) != kv_heads || v.shape(2) != kv_rows || v.shape(3) != kHeadDim
         || mask.shape(0) != rows)
         throw std::runtime_error("Tree merge shape mismatch");
     if (out.shape(0) != batch || out.shape(1) != rows || out.shape(2) != heads * kHeadDim
@@ -4035,7 +4035,7 @@ void flash_attention_decode_tree_merge(
     need_contiguous(mask, "flash_attention_decode_tree_merge", "mask");
     launch_flash_decode_tree_merge(
         out.data(), lse.data(), q.data(), k.data(), v.data(), mask.data(), merged.data(),
-        static_cast<int>(batch), static_cast<int>(rows), static_cast<int>(heads), static_cast<int>(kv_heads),
+        static_cast<int>(batch), static_cast<int>(rows), static_cast<int>(kv_rows), static_cast<int>(heads), static_cast<int>(kv_heads),
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),

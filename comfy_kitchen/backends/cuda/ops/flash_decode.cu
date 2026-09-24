@@ -158,7 +158,8 @@ extern "C" void launch_flash_decode_gqa(
 // exactly as further softmax columns:
 //   s_t = scale * q . k_t;  m = max(lse, max_t s_t)
 //   o = (out * e^(lse - m) + sum_t v_t * e^(s_t - m)) / (e^(lse - m) + sum_t e^(s_t - m))
-// mask[j] holds the rows to fold into row j (bit t = row t, always including j itself).
+// mask[j] holds the k/v rows to fold into query row j (bit t = k/v row t); the k/v rows may be a
+// superset of the query rows (a draft level merging against the tree's side rows).
 // One warp per (batch, row, head), eight dims per lane, fp32 math, bf16 out.
 namespace tree_merge {
 
@@ -170,7 +171,7 @@ __global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_tree_merge_kern
     const __nv_bfloat16* __restrict__ out, const float* __restrict__ lse,
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const int* __restrict__ mask, __nv_bfloat16* __restrict__ merged,
-    int total, int rows, int heads, int groups, float scale,
+    int total, int rows, int kv_rows, int heads, int groups, float scale,
     int64_t q_bs, int64_t q_hs, int64_t q_rs,
     int64_t k_bs, int64_t k_hs, int64_t k_rs,
     int64_t v_bs, int64_t v_hs, int64_t v_rs,
@@ -195,7 +196,7 @@ __global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_tree_merge_kern
 #pragma unroll
     for (int t = 0; t < kMaxRows; ++t) {
         s[t] = -INFINITY;
-        if (t < rows && (bits & (1 << t))) {
+        if (t < kv_rows && (bits & (1 << t))) {
             const uint4 kv4 = *reinterpret_cast<const uint4*>(k + b * k_bs + kh * k_hs + t * k_rs + d0);
             const auto* k2 = reinterpret_cast<const __nv_bfloat162*>(&kv4);
             float dot = 0.f;
@@ -224,7 +225,7 @@ __global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_tree_merge_kern
     }
 #pragma unroll
     for (int t = 0; t < kMaxRows; ++t) {
-        if (t < rows && (bits & (1 << t))) {
+        if (t < kv_rows && (bits & (1 << t))) {
             const float w = expf(s[t] - m);
             denom += w;
             const uint4 vv = *reinterpret_cast<const uint4*>(v + b * v_bs + kh * v_hs + t * v_rs + d0);
@@ -250,7 +251,7 @@ __global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_tree_merge_kern
 
 extern "C" void launch_flash_decode_tree_merge(
     const void* out, const float* lse, const void* q, const void* k, const void* v, const int* mask, void* merged,
-    int batch, int rows, int heads, int kv_heads,
+    int batch, int rows, int kv_rows, int heads, int kv_heads,
     int64_t q_batch_stride, int64_t q_head_stride, int64_t q_row_stride,
     int64_t k_batch_stride, int64_t k_head_stride, int64_t k_row_stride,
     int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
@@ -263,7 +264,7 @@ extern "C" void launch_flash_decode_tree_merge(
         static_cast<const __nv_bfloat16*>(out), lse,
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const __nv_bfloat16*>(v),
         mask, static_cast<__nv_bfloat16*>(merged),
-        warps, rows, heads, heads / kv_heads, 1.0f / sqrtf(float(kMergeHeadDim)),
+        warps, rows, kv_rows, heads, heads / kv_heads, 1.0f / sqrtf(float(kMergeHeadDim)),
         q_batch_stride, q_head_stride, q_row_stride,
         k_batch_stride, k_head_stride, k_row_stride,
         v_batch_stride, v_head_stride, v_row_stride,
