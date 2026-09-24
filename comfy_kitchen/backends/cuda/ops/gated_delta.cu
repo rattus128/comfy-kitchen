@@ -51,14 +51,14 @@ __global__ void deltanet_conv_deferred_kernel(
     const T* __restrict__ conv_w,      // [C, KS] depthwise taps
     const T* __restrict__ conv_b,      // [C] or nullptr
     T* __restrict__ qkv_buf,           // [2, B, C, kSlotMax] silu(conv) of the previous / current step
-    const int* __restrict__ ctl,       // {pending, parity}
-    int B, int C, int S, int KS, int ldp)
+    const int* __restrict__ ctl,       // {pending, parity, alt}
+    int B, int C, int S, int KS, int ldp, int tree)
 {
     const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= B * C)
         return;
     const int b = idx / C, c = idx - b * C;
-    const int pending = ctl[0], par = ctl[1];
+    const int pending = ctl[0], par = ctl[1], alt = ctl[2];
     const int L = KS - 1;
     constexpr int MAXW = 16;   // (KS - 1) + S <= 7 + 8
     const int64_t proj_slab = static_cast<int64_t>(B) * kSlotMax * C;
@@ -71,7 +71,8 @@ __global__ void deltanet_conv_deferred_kernel(
         if (j < L) {
             // committed window = the last L of [conv_state, prev_proj[0..pending))
             const int i = pending + j;
-            win[j] = i < L ? to_f<T>(state_row[i]) : to_f<T>(prev_proj[static_cast<int64_t>(i - L) * C]);
+            const int slot = i - L == pending - 1 && alt >= 0 ? alt : i - L;   // an accepted sibling replaces the last chain token
+            win[j] = i < L ? to_f<T>(state_row[i]) : to_f<T>(prev_proj[static_cast<int64_t>(slot) * C]);
         } else if (j < L + S) {
             win[j] = to_f<T>(proj[(static_cast<int64_t>(b) * S + (j - L)) * ldp + c]);
         } else {
@@ -91,11 +92,14 @@ __global__ void deltanet_conv_deferred_kernel(
     #pragma unroll
     for (int s = 0; s < kSlotMax; ++s) {
         if (s < S) {
+            // tree verify: slot s > tree is the sibling of chain slot s - tree and shares its
+            // window except for the newest tap, which is the sibling's own projection
+            const int base = tree != 0 && s > tree ? s - tree : s;
             float acc = 0.0f;
             #pragma unroll
             for (int j = 0; j < 8; ++j)
                 if (j < KS)
-                    acc = fmaf(w[j], win[s + j], acc);
+                    acc = fmaf(w[j], j == KS - 1 ? win[L + s] : win[base + j], acc);
             const float y = round_to<T>(acc + bias);
             cur_qkv[s] = comfy::from_float<T>(y / (1.0f + expf(-y)));
             cur_proj[static_cast<int64_t>(s) * C] = comfy::from_float<T>(win[L + s]);
@@ -113,7 +117,11 @@ __global__ void deltanet_conv_deferred_kernel(
 // 16-row slice is 4 conflict-free 128-bit reads. The RMSNorm sum of squares is
 // the only cross-block value: each block pushes its partial into every sibling's
 // shared memory, one cluster barrier, then sums in fixed rank order.
-template <typename T, int DK, int DV, int S>
+// Tree: the S = 2d + 1 current tokens are a root, a chain of d drafts and d siblings
+// (slot d + k is an alternative to chain slot k, sharing its parent). Sibling outputs
+// come from the parent's state without committing; the next step's ctl[2] names the
+// accepted sibling slot, replayed in place of the last accepted chain token.
+template <typename T, int DK, int DV, int S, bool Tree>
 __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(256, 2)
 gated_delta_decode_deferred_kernel(
     const T* __restrict__ x,           // [B, S, Hd]
@@ -124,7 +132,7 @@ gated_delta_decode_deferred_kernel(
     const T* __restrict__ qkv_buf,     // [2, B, C, kSlotMax] conv+silu output, previous / current step
     float* __restrict__ gates_buf,     // [2, B, kSlotMax, Hv, 2]: decay g, beta
     float* __restrict__ sumsq_buf,     // [2, B, kSlotMax, Hk, 2]: sum q^2, sum k^2
-    const int* __restrict__ ctl,       // {pending, parity}
+    const int* __restrict__ ctl,       // {pending, parity, alt}
     float* __restrict__ state,         // [B, Hv, DK, DV] committed state, updated in place
     T* __restrict__ out,               // [B, S, Hv, DV]
     const T* __restrict__ z,           // [B, S, Hv*DV] norm gate, row stride ldz
@@ -160,7 +168,9 @@ gated_delta_decode_deferred_kernel(
     const int gc = rank * COLS + wid * 4 + col;   // this lane's value column
     const int gqa = Hv / Hk;
     const int hk = h / gqa;
-    const int pending = ctl[0], par = ctl[1];
+    const int pending = ctl[0], par = ctl[1], alt = ctl[2];
+    // side-buffer slot of replay token i: an accepted sibling replaces the last chain token
+    auto prev_slot = [&](int i) { return i == pending - 1 && alt >= 0 ? alt : i; };
     const int64_t qkv_slab = static_cast<int64_t>(B) * C * kSlotMax;
     const T* __restrict__ prev_qkv = qkv_buf + (1 - par) * qkv_slab + static_cast<int64_t>(b) * C * kSlotMax;
     const T* __restrict__ cur_qkv = qkv_buf + par * qkv_slab + static_cast<int64_t>(b) * C * kSlotMax;
@@ -217,9 +227,9 @@ gated_delta_decode_deferred_kernel(
         const int i = t - GNT;
         if (i < pending) {
             const float2 g = *reinterpret_cast<const float2*>(
-                gates_buf + (((1 - par) * static_cast<int64_t>(B) + b) * kSlotMax + i) * Hv * 2 + h * 2);
+                gates_buf + (((1 - par) * static_cast<int64_t>(B) + b) * kSlotMax + prev_slot(i)) * Hv * 2 + h * 2);
             const float2 n = *reinterpret_cast<const float2*>(
-                sumsq_buf + (((1 - par) * static_cast<int64_t>(B) + b) * kSlotMax + i) * Hk * 2 + hk * 2);
+                sumsq_buf + (((1 - par) * static_cast<int64_t>(B) + b) * kSlotMax + prev_slot(i)) * Hk * 2 + hk * 2);
             sg[i][0] = g.x;
             sg[i][1] = g.y;
             ssum[i][0] = n.x;
@@ -271,7 +281,7 @@ gated_delta_decode_deferred_kernel(
         #pragma unroll
         for (int i = 0; i < MAXT; ++i) {
             if (i < pending + S) {
-                const T* buf = i < pending ? prev_qkv + i : cur_qkv + (i - pending);
+                const T* buf = i < pending ? prev_qkv + prev_slot(i) : cur_qkv + (i - pending);
                 const float ss = ssum[i][is_q ? 0 : 1];
                 const float n = fmaxf(sqrtf(ss), 1e-12f);
                 const float v = to_f<T>(buf[src * kSlotMax]);
@@ -282,14 +292,15 @@ gated_delta_decode_deferred_kernel(
         for (int e = t; e < MAXT * COLS; e += NT) {
             const int i = e / COLS, cc = e - i * COLS;
             if (i < pending + S) {
-                const T* buf = i < pending ? prev_qkv + i : cur_qkv + (i - pending);
+                const T* buf = i < pending ? prev_qkv + prev_slot(i) : cur_qkv + (i - pending);
                 sv[i][cc] = to_f<T>(buf[(vsrc + cc) * kSlotMax]);
             }
         }
     }
     __syncthreads();
 
-    auto step = [&](int i, bool emit, int s) {
+    // commit=false: a sibling's output from the same pre-state, leaving st untouched
+    auto step = [&](int i, bool emit, int s, bool commit = true) {
         const float4* __restrict__ skr = reinterpret_cast<const float4*>(sk + i * DK) + rg;
         const float4* __restrict__ sqr = reinterpret_cast<const float4*>(sq + i * DK) + rg;
         const float g_s = sg[i][0], b_s = sg[i][1];
@@ -313,8 +324,9 @@ gated_delta_decode_deferred_kernel(
         float o = 0.0f;
         #pragma unroll
         for (int r = 0; r < KPL; ++r) {
-            st[r] = fmaf(k[r], delta, sgs[r]);
-            o = fmaf(q[r], st[r], o);
+            const float n = fmaf(k[r], delta, sgs[r]);
+            if (commit) st[r] = n;
+            o = fmaf(q[r], n, o);
         }
         if (emit) {
             o += __shfl_xor_sync(0xffffffffu, o, 4);
@@ -331,9 +343,19 @@ gated_delta_decode_deferred_kernel(
     for (int r = 0; r < KPL; ++r)
         state[state_off + tile_off + r * DV] = st[r];
     // current tokens: outputs only, state stays uncommitted until the next step
-    #pragma unroll
-    for (int s = 0; s < S; ++s)
-        step(pending + s, true, s);
+    if constexpr (Tree) {
+        constexpr int D = (S - 1) / 2;
+        step(pending, true, 0);
+        #pragma unroll
+        for (int k = 1; k <= D; ++k) {
+            step(pending + D + k, true, D + k, false);   // sibling of chain slot k, from slot k-1's state
+            step(pending + k, true, k);
+        }
+    } else {
+        #pragma unroll
+        for (int s = 0; s < S; ++s)
+            step(pending + s, true, s);
+    }
     __syncthreads();
 
     // warp s finishes token s: block sum of squares to every sibling, then the norm
@@ -372,10 +394,10 @@ extern "C" bool launch_gated_delta_decode_deferred(
     const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl,
     void* state, void* out, const void* z, const void* norm_w, float eps,
     int64_t B, int64_t Hv, int64_t Hk, int64_t S, int64_t DK, int64_t DV, int64_t C, int64_t Hd,
-    int64_t key_dim, float scale, int64_t ldz, int dtype_code, cudaStream_t stream)
+    int64_t key_dim, float scale, int64_t ldz, int dtype_code, int64_t tree, cudaStream_t stream)
 {
     if (DK != 128 || DV != 128 || S < 1 || S > kSlotMax || Hk <= 0 || Hv % Hk != 0 || Hd % 8 != 0
-            || dtype_code < 0 || dtype_code > 2)
+            || dtype_code < 0 || dtype_code > 2 || (tree != 0 && S != 2 * tree + 1))
         return false;
     int device = 0, cc_major = 0;
     if (cudaGetDevice(&device) != cudaSuccess
@@ -383,8 +405,8 @@ extern "C" bool launch_gated_delta_decode_deferred(
             || cc_major < 9)
         return false;
     return DISPATCH_FP_DTYPE(dtype_code, T, [&] {
-        auto launch = [&]<int Steps>() {
-            gated_delta_decode_deferred_kernel<T, 128, 128, Steps><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
+        auto launch = [&]<int Steps, bool IsTree = false>() {
+            gated_delta_decode_deferred_kernel<T, 128, 128, Steps, IsTree><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
                 static_cast<const T*>(x), static_cast<const T*>(w_a), static_cast<const T*>(w_b),
                 static_cast<const float*>(dt_bias), static_cast<const float*>(g_decay),
                 static_cast<const T*>(qkv_buf), static_cast<float*>(gates_buf), static_cast<float*>(sumsq_buf),
@@ -393,6 +415,14 @@ extern "C" bool launch_gated_delta_decode_deferred(
                 static_cast<int>(B), static_cast<int>(Hv), static_cast<int>(Hk),
                 static_cast<int>(C), static_cast<int>(Hd), static_cast<int>(key_dim), scale, static_cast<int>(ldz));
         };
+        if (tree != 0) {
+            switch (tree) {
+                case 1: launch.template operator()<3, true>(); break;
+                case 2: launch.template operator()<5, true>(); break;
+                default: launch.template operator()<7, true>(); break;
+            }
+            return cudaGetLastError() == cudaSuccess;
+        }
         switch (S) {
             case 1: launch.template operator()<1>(); break;
             case 2: launch.template operator()<2>(); break;
@@ -410,9 +440,10 @@ extern "C" bool launch_gated_delta_decode_deferred(
 extern "C" bool launch_deltanet_conv_deferred(
     const void* proj, void* proj_buf, void* conv_state, const void* conv_w, const void* conv_b,
     void* qkv_buf, const void* ctl,
-    int64_t B, int64_t C, int64_t S, int64_t KS, int64_t ldp, int dtype_code, cudaStream_t stream)
+    int64_t B, int64_t C, int64_t S, int64_t KS, int64_t ldp, int dtype_code, int64_t tree, cudaStream_t stream)
 {
-    if (S < 1 || S > kSlotMax || KS < 2 || KS > 8 || dtype_code < 0 || dtype_code > 2)
+    if (S < 1 || S > kSlotMax || KS < 2 || KS > 8 || dtype_code < 0 || dtype_code > 2
+            || (tree != 0 && S != 2 * tree + 1))
         return false;
     const int threads = 256;
     const unsigned grid = static_cast<unsigned>((B * C + threads - 1) / threads);
@@ -421,7 +452,8 @@ extern "C" bool launch_deltanet_conv_deferred(
             static_cast<const T*>(proj), static_cast<T*>(proj_buf), static_cast<T*>(conv_state),
             static_cast<const T*>(conv_w), static_cast<const T*>(conv_b), static_cast<T*>(qkv_buf),
             static_cast<const int*>(ctl),
-            static_cast<int>(B), static_cast<int>(C), static_cast<int>(S), static_cast<int>(KS), static_cast<int>(ldp));
+            static_cast<int>(B), static_cast<int>(C), static_cast<int>(S), static_cast<int>(KS), static_cast<int>(ldp),
+            static_cast<int>(tree));
         return cudaGetLastError() == cudaSuccess;
     });
 }

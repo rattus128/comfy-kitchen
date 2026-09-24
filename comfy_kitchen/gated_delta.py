@@ -72,12 +72,15 @@ def deltanet_conv_step_deferred(
     proj_buf: torch.Tensor,
     qkv_buf: torch.Tensor,
     ctl: torch.Tensor,
+    tree: int = 0,
 ) -> None:
     """Depthwise causal conv + silu over proj [B, S, C] into qkv_buf[ctl[1]] (stride SLOT_MAX).
 
-    ctl is an int32 device pair {pending, parity}: the first `pending` tokens of
-    the previous step (proj_buf[1 - parity]) are committed into conv_state first;
-    the current projections are saved to proj_buf[parity] for the next step.
+    ctl is an int32 device triple {pending, parity, alt}: the first `pending` tokens of
+    the previous step (proj_buf[1 - parity]) are committed into conv_state first, slot
+    `alt` (if >= 0) replacing the last of them; the current projections are saved to
+    proj_buf[parity] for the next step. tree = d marks a verify of S = 2d + 1 tokens
+    whose slots d + 1..2d are siblings of chain slots 1..d.
     """
     if not deferred_is_available(proj.device):
         raise RuntimeError("deltanet_conv_step_deferred requires the CUDA extension on sm_90+")
@@ -85,7 +88,7 @@ def deltanet_conv_step_deferred(
     wrap = _cuda_backend._wrap_for_dlpack
     ok = _cuda_backend._C.deltanet_conv_deferred(
         wrap(proj), wrap(proj_buf), wrap(conv_state), wrap(conv_w.reshape(channels, -1).contiguous()),
-        wrap(conv_b.contiguous()) if conv_b is not None else None, wrap(qkv_buf), wrap(ctl),
+        wrap(conv_b.contiguous()) if conv_b is not None else None, wrap(qkv_buf), wrap(ctl), tree,
         torch.cuda.current_stream(proj.device).cuda_stream,
     )
     if not ok:
@@ -109,13 +112,16 @@ def gated_delta_decode_deferred(
     gates_buf: torch.Tensor,
     sumsq_buf: torch.Tensor,
     ctl: torch.Tensor,
+    tree: int = 0,
 ) -> torch.Tensor:
     """S GatedDeltaNet decode steps from qkv_buf[ctl[1]] written by deltanet_conv_step_deferred.
 
     Replays the `ctl[0]` accepted tokens of the previous step from the
-    [1 - parity] side buffers, writes the committed fp32 state [B, Hv, DK, DV]
-    in place, then returns the outputs of the S current tokens without
-    committing them. State, dt_bias and g_decay must be contiguous.
+    [1 - parity] side buffers (slot ctl[2], if >= 0, standing in for the last one),
+    writes the committed fp32 state [B, Hv, DK, DV] in place, then returns the
+    outputs of the S current tokens without committing them. tree = d: S = 2d + 1
+    tokens, slots d + 1..2d being siblings of chain slots 1..d (see
+    deltanet_conv_step_deferred). State, dt_bias and g_decay must be contiguous.
     """
     batch, seq, _ = x.shape
     heads, key_dim_head, value_dim = state.shape[1], state.shape[2], state.shape[3]
@@ -128,7 +134,7 @@ def gated_delta_decode_deferred(
         wrap(dt_bias), wrap(g_decay), wrap(qkv_buf), wrap(gates_buf), wrap(sumsq_buf), wrap(ctl),
         wrap(state), wrap(out),
         wrap(z.reshape(batch, seq, heads * value_dim)), wrap(norm_weight.contiguous()), eps,
-        key_dim, num_key_heads, scale,
+        key_dim, num_key_heads, scale, tree,
         torch.cuda.current_stream(x.device).cuda_stream,
     )
     if not ok:

@@ -120,12 +120,13 @@ def flash_attention_decode_gqa_is_available(device: torch.device | int | None = 
 
 
 def flash_attention_decode_gqa(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_lengths: torch.Tensor
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_lengths: torch.Tensor, return_lse: bool = False
 ) -> torch.Tensor:
     """Causal GQA decode attention for BF16 q [B, H, S, 256] over k/v [B, Hk, capacity, 256].
 
     Query row j of batch b attends cache slots < kv_lengths[b] - S + j + 1 (the MTP verify
-    staircase; S == 1 is plain decode). Returns [B, S, H*256]."""
+    staircase; S == 1 is plain decode). Returns [B, S, H*256], with the fp32 log-sum-exp of
+    the scaled scores [B, H, S] as a second value when return_lse."""
     batch, heads, query_length, head_dim = q.shape
     _, kv_heads, kv_capacity, _ = k.shape
     if not flash_attention_decode_gqa_is_available(q.device):
@@ -154,4 +155,6 @@ def flash_attention_decode_gqa(
         num_splits,
         torch.cuda.current_stream(q.device).cuda_stream,
     )
+    if return_lse:
+        return output, softmax_lse.view(batch, heads, query_length)
     return output
