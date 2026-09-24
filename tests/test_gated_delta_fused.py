@@ -123,6 +123,18 @@ def _eager_step(proj, conv_state, w, b, x, w_a, w_b, dt_bias, g_decay, state, z,
     return out
 
 
+def _ctl(pending, parity, slots=None, parent=None, prog=None, device="cuda"):
+    """ctl = {pending, parity, slot[8], parent[8], prog[8]}; defaults describe a straight chain."""
+    t = torch.zeros(ck.gated_delta_ctl_ints, dtype=torch.int32)
+    t[0], t[1] = pending, parity
+    t[2:10] = torch.tensor(list(slots) + list(range(len(slots), 8)) if slots else list(range(8)), dtype=torch.int32)
+    t[10:18] = torch.tensor(list(parent) + [-1] * (8 - len(parent)) if parent else [r - 1 for r in range(8)],
+                            dtype=torch.int32)
+    if prog:
+        t[18:18 + len(prog)] = torch.tensor(prog, dtype=torch.int32)
+    return t.to(device)
+
+
 @pytest.mark.skipif(not ck.gated_delta_deferred_is_available(), reason="deferred DeltaNet decode kernels unavailable")
 class TestGatedDeltaDeferred:
     # (tokens in the verify step, tokens the verifier accepted) per step; the
@@ -144,7 +156,7 @@ class TestGatedDeltaDeferred:
         ref_conv_state, ref_state = conv_state.clone(), state.clone()
 
         qkv_buf, proj_buf, gates_buf, sumsq_buf = ck.gated_delta_deferred_buffers(B, C, HV, HK, dtype, torch.device(dev))
-        ctl = torch.zeros((3,), dtype=torch.int32, device=dev)
+        ctl = torch.zeros((ck.gated_delta_ctl_ints,), dtype=torch.int32, device=dev)
         tol = 1e-5 if dtype == torch.float32 else 5e-3
         pending, parity = 0, 0
         for i, (seq, accepts) in enumerate(self.STEPS):
@@ -152,7 +164,7 @@ class TestGatedDeltaDeferred:
             x = torch.randn(B, seq, HD, device=dev, dtype=dtype)
             z = torch.randn(B, seq, HV * DV, device=dev, dtype=dtype)
 
-            ctl.copy_(torch.tensor([pending, parity, -1], dtype=torch.int32))
+            ctl.copy_(_ctl(pending, parity))
             ck.deltanet_conv_step_deferred(proj, conv_state, w, b, proj_buf, qkv_buf, ctl)
             got = ck.gated_delta_decode_deferred(x, w_a, w_b, dt_bias, g_decay, state, KEY_DIM, HK, SCALE,
                                                  z, norm_w, EPS, qkv_buf, gates_buf, sumsq_buf, ctl)
@@ -172,14 +184,30 @@ class TestGatedDeltaDeferred:
                         ref_state, z[:, :pending], norm_w, pending)
             parity ^= 1
 
+    # M = 8 "symmetric tree-2 + 3 straight": rows c(0), d1(1), d2(2), d3(3) chain; a1(4) sibling
+    # of d1; a2(5) sibling of d2; b1(6), b2(7) children of a1. Depth-first program: the d-chain
+    # runs first from c (a2 is a leaf, so it does not commit), then the saved c state is restored
+    # for a1 (whose own children are leaves, so a1 commits).
+    TREE_PARENT = [-1, 0, 1, 2, 0, 1, 4, 4]
+    TREE_PROG = [
+        0 | 32 | 64,   # c: commit, save
+        1 | 32,        # d1: commit
+        5,             # a2: leaf off d1
+        2 | 32,        # d2: commit
+        3 | 32,        # d3: commit
+        4 | 16 | 32,   # a1: restore c, commit
+        6,             # b1: leaf off a1
+        7,             # b2: leaf off a1
+    ]
+
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-    def test_tree_siblings_and_alt_commit(self, dtype, seed):
-        # tree verify: slots 0..d are the draft chain, slot d + k the runner-up sibling of
-        # chain slot k (same parent, slot k - 1). Every sibling output must equal the eager
-        # output of the sequence chain[:k] + sibling, and committing through the sibling
-        # (ctl alt) must equal committing that sequence.
+    def test_tree_rows_and_path_commit(self, dtype, seed):
+        # Every row of a verify tree must equal the eager run of its own root-to-row token
+        # sequence, and committing an accepted path (ctl slots) must equal running that
+        # sequence alone.
         dev = "cuda"
-        d = 3
+        parent, prog = self.TREE_PARENT, self.TREE_PROG
+        S = len(parent)
         w = torch.randn(C, 1, KS, device=dev, dtype=dtype) * 0.5
         b = torch.randn(C, device=dev, dtype=dtype) * 0.1
         w_a = torch.randn(HV, HD, device=dev, dtype=dtype) * 0.05
@@ -191,65 +219,69 @@ class TestGatedDeltaDeferred:
         state = torch.randn(B, HV, DK, DV, device=dev) * 0.1
         ref_conv_state, ref_state = conv_state.clone(), state.clone()
         qkv_buf, proj_buf, gates_buf, sumsq_buf = ck.gated_delta_deferred_buffers(B, C, HV, HK, dtype, torch.device(dev))
-        ctl = torch.zeros((3,), dtype=torch.int32, device=dev)
+        ctl = torch.zeros((ck.gated_delta_ctl_ints,), dtype=torch.int32, device=dev)
         tol = 1e-5 if dtype == torch.float32 else 5e-3
 
-        def run(proj, x, z, pending, parity, alt, tree):
-            ctl.copy_(torch.tensor([pending, parity, alt], dtype=torch.int32))
-            ck.deltanet_conv_step_deferred(proj, conv_state, w, b, proj_buf, qkv_buf, ctl, tree)
+        def run(proj, x, z, ctl_host, tree):
+            ctl.copy_(ctl_host)
+            ck.deltanet_conv_step_deferred(proj, conv_state, w, b, proj_buf, qkv_buf, ctl)
             got = ck.gated_delta_decode_deferred(x, w_a, w_b, dt_bias, g_decay, state, KEY_DIM, HK, SCALE,
                                                  z, norm_w, EPS, qkv_buf, gates_buf, sumsq_buf, ctl, tree)
             torch.cuda.synchronize()
             return got
+
+        def path(r):
+            rows = []
+            while r >= 0:
+                rows.append(r)
+                r = parent[r]
+            return rows[::-1]
 
         # step 0: plain verify of 4 tokens, accept 1 (commit 2) so the replay path is exercised too
         seq = 4
         proj = torch.randn(B, seq, C, device=dev, dtype=dtype)
         x = torch.randn(B, seq, HD, device=dev, dtype=dtype)
         z = torch.randn(B, seq, HV * DV, device=dev, dtype=dtype)
-        run(proj, x, z, 0, 0, -1, 0)
+        run(proj, x, z, _ctl(0, 0), 0)
         _eager_step(proj[:, :2], ref_conv_state, w, b, x[:, :2], w_a, w_b, dt_bias, g_decay, ref_state, z[:, :2], norm_w, 2)
 
-        # step 1: tree verify, S = 2d + 1
-        S = 2 * d + 1
+        # step 1: the tree
         proj = torch.randn(B, S, C, device=dev, dtype=dtype)
         x = torch.randn(B, S, HD, device=dev, dtype=dtype)
         z = torch.randn(B, S, HV * DV, device=dev, dtype=dtype)
-        got = run(proj, x, z, 2, 1, -1, d)
+        got = run(proj, x, z, _ctl(2, 1, parent=parent, prog=prog), 1)
         assert torch.equal(conv_state, ref_conv_state), "tree step: conv state"
         assert rel_err(state, ref_state) < tol, "tree step: recurrent state"
-        ref_chain = _eager_step(proj[:, :d + 1], ref_conv_state.clone(), w, b, x[:, :d + 1], w_a, w_b, dt_bias,
-                                g_decay, ref_state.clone(), z[:, :d + 1], norm_w, d + 1)
-        assert rel_err(got[:, :d + 1].float(), ref_chain.float()) < tol, "tree step: chain rows"
-        for k in range(1, d + 1):
-            idx = list(range(k)) + [d + k]
-            ref_sib = _eager_step(proj[:, idx], ref_conv_state.clone(), w, b, x[:, idx], w_a, w_b, dt_bias,
-                                  g_decay, ref_state.clone(), z[:, idx], norm_w, k + 1)
-            assert rel_err(got[:, d + k].float(), ref_sib[:, k].float()) < tol, f"tree step: sibling {k}"
+        for r in range(S):
+            rows = path(r)
+            ref = _eager_step(proj[:, rows], ref_conv_state.clone(), w, b, x[:, rows], w_a, w_b, dt_bias,
+                              g_decay, ref_state.clone(), z[:, rows], norm_w, len(rows))
+            assert rel_err(got[:, r].float(), ref[:, -1].float()) < tol, f"tree step: row {r}"
 
-        # step 2: commit chain slots 0..a and sibling a + 1 (alt slot d + 1 + a), then verify 3 plain tokens
-        a = 1
-        idx = list(range(a + 1)) + [d + 1 + a]
-        _eager_step(proj[:, idx], ref_conv_state, w, b, x[:, idx], w_a, w_b, dt_bias, g_decay, ref_state,
-                    z[:, idx], norm_w, a + 2)
+        # step 2: commit the accepted path c -> a1 -> b2 (rows 0, 4, 7), then verify 3 plain tokens
+        accepted = [0, 4, 7]
+        _eager_step(proj[:, accepted], ref_conv_state, w, b, x[:, accepted], w_a, w_b, dt_bias, g_decay,
+                    ref_state, z[:, accepted], norm_w, len(accepted))
         seq = 3
         proj = torch.randn(B, seq, C, device=dev, dtype=dtype)
         x = torch.randn(B, seq, HD, device=dev, dtype=dtype)
         z = torch.randn(B, seq, HV * DV, device=dev, dtype=dtype)
-        got = run(proj, x, z, a + 2, 0, d + 1 + a, 0)
-        assert torch.equal(conv_state, ref_conv_state), "alt commit: conv state"
-        assert rel_err(state, ref_state) < tol, "alt commit: recurrent state"
+        got = run(proj, x, z, _ctl(len(accepted), 0, slots=accepted), 0)
+        assert torch.equal(conv_state, ref_conv_state), "path commit: conv state"
+        assert rel_err(state, ref_state) < tol, "path commit: recurrent state"
         ref_out = _eager_step(proj, ref_conv_state.clone(), w, b, x, w_a, w_b, dt_bias, g_decay,
                               ref_state.clone(), z, norm_w, seq)
-        assert rel_err(got.float(), ref_out.float()) < tol, "alt commit: out"
+        assert rel_err(got.float(), ref_out.float()) < tol, "path commit: out"
 
     def test_rejects_long_sequence(self):
         seq = 9
-        dtype = torch.bfloat16
-        proj = torch.randn(B, seq, C, device="cuda", dtype=dtype)
-        conv_state = torch.zeros(B, C, KS - 1, device="cuda", dtype=dtype)
-        w = torch.randn(C, 1, KS, device="cuda", dtype=dtype)
-        qkv_buf, proj_buf, _, _ = ck.gated_delta_deferred_buffers(B, C, HV, HK, dtype, torch.device("cuda"))
-        ctl = torch.zeros((3,), dtype=torch.int32, device="cuda")
+        conv_out = torch.randn(B, C, seq, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(B, seq, HD, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(HV, HD, device="cuda", dtype=torch.bfloat16)
+        state = torch.zeros(B, HV, DK, DV, device="cuda")
+        z = torch.zeros(B, seq, HV * DV, device="cuda", dtype=torch.bfloat16)
+        norm_w = torch.ones(DV, device="cuda", dtype=torch.bfloat16)
         with pytest.raises(RuntimeError):
-            ck.deltanet_conv_step_deferred(proj, conv_state, w, None, proj_buf, qkv_buf, ctl)
+            ck.gated_delta_decode_fused(conv_out, x, w, w, torch.zeros(HV, device="cuda"), -torch.ones(HV, device="cuda"),
+                                        state, KEY_DIM, HK, SCALE, z, norm_w, EPS)
+

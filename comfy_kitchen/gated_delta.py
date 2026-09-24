@@ -10,6 +10,7 @@ else:
     _hip_backend = None
 
 SLOT_MAX = 8  # token slots per deferred side buffer; verify steps run S <= SLOT_MAX tokens
+CTL_INTS = 2 + 3 * SLOT_MAX  # ctl = {pending, parity, slot[8], parent[8], prog[8]}
 
 
 def is_available(device: torch.device | int | None = None, key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
@@ -72,15 +73,15 @@ def deltanet_conv_step_deferred(
     proj_buf: torch.Tensor,
     qkv_buf: torch.Tensor,
     ctl: torch.Tensor,
-    tree: int = 0,
 ) -> None:
     """Depthwise causal conv + silu over proj [B, S, C] into qkv_buf[ctl[1]] (stride SLOT_MAX).
 
-    ctl is an int32 device triple {pending, parity, alt}: the first `pending` tokens of
-    the previous step (proj_buf[1 - parity]) are committed into conv_state first, slot
-    `alt` (if >= 0) replacing the last of them; the current projections are saved to
-    proj_buf[parity] for the next step. tree = d marks a verify of S = 2d + 1 tokens
-    whose slots d + 1..2d are siblings of chain slots 1..d.
+    ctl is an int32 device vector of CTL_INTS entries {pending, parity, slot[8], parent[8],
+    prog[8]}: the `pending` accepted tokens of the previous step, at its side-buffer slots
+    slot[0..pending) of proj_buf[1 - parity], are committed into conv_state first; then each
+    current row is convolved over its own ancestors, parent[r] naming the row that row r
+    extends (-1: the committed window). The current projections are saved to proj_buf[parity]
+    for the next step.
     """
     if not deferred_is_available(proj.device):
         raise RuntimeError("deltanet_conv_step_deferred requires the CUDA extension on sm_90+")
@@ -88,7 +89,7 @@ def deltanet_conv_step_deferred(
     wrap = _cuda_backend._wrap_for_dlpack
     ok = _cuda_backend._C.deltanet_conv_deferred(
         wrap(proj), wrap(proj_buf), wrap(conv_state), wrap(conv_w.reshape(channels, -1).contiguous()),
-        wrap(conv_b.contiguous()) if conv_b is not None else None, wrap(qkv_buf), wrap(ctl), tree,
+        wrap(conv_b.contiguous()) if conv_b is not None else None, wrap(qkv_buf), wrap(ctl),
         torch.cuda.current_stream(proj.device).cuda_stream,
     )
     if not ok:
@@ -116,12 +117,12 @@ def gated_delta_decode_deferred(
 ) -> torch.Tensor:
     """S GatedDeltaNet decode steps from qkv_buf[ctl[1]] written by deltanet_conv_step_deferred.
 
-    Replays the `ctl[0]` accepted tokens of the previous step from the
-    [1 - parity] side buffers (slot ctl[2], if >= 0, standing in for the last one),
-    writes the committed fp32 state [B, Hv, DK, DV] in place, then returns the
-    outputs of the S current tokens without committing them. tree = d: S = 2d + 1
-    tokens, slots d + 1..2d being siblings of chain slots 1..d (see
-    deltanet_conv_step_deferred). State, dt_bias and g_decay must be contiguous.
+    Replays the `ctl[0]` accepted tokens of the previous step from the [1 - parity] side
+    buffers (at the slots named by ctl), writes the committed fp32 state [B, Hv, DK, DV] in
+    place, then returns the outputs of the S current rows without committing them. tree != 0
+    runs the rows through ctl's program (entry = row | restore << 4 | commit << 5 | save << 6,
+    in depth-first order) instead of as a straight chain; a row's ancestors are ctl's parent[]
+    (see deltanet_conv_step_deferred). State, dt_bias and g_decay must be contiguous.
     """
     batch, seq, _ = x.shape
     heads, key_dim_head, value_dim = state.shape[1], state.shape[2], state.shape[3]
