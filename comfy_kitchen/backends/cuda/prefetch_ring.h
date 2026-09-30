@@ -43,7 +43,6 @@ struct PrefetchRingState {
     uint32_t credits;     // PREFETCH_RING_CREDIT_* mask: non-weight consumers that credit their reads
     uint32_t stalled;     // issuer CTAs that gave up waiting for consumption (diagnostic)
     uint64_t consumed;    // bytes whose demand loads completed this step
-    uint64_t next_batch;  // next unclaimed issue batch of this step (issuer CTAs claim with atomicAdd)
     // diagnostics, cumulative over steps (read with prefetch_ring_read_stats)
     uint64_t touched;     // bytes the issuer requested
     uint64_t skipped;     // bytes the issuer skipped because demand got there first
