@@ -13,6 +13,23 @@ else:
 
 _MINIMUM_CAPABILITY = (8, 0)
 
+# Split-KV partials are folded by the last-arriving split CTA inside the decode kernel
+# (one launch) rather than by a second combine launch. Per-device arrival counters; the kernel
+# rearms them, so the buffer only needs zeroing once. False restores the two-launch path.
+fused_combine = True
+_COMBINE_COUNTERS = 4096
+_combine_counters: dict[torch.device, torch.Tensor] = {}
+
+
+def _counters(device: torch.device, needed: int, num_splits: int) -> torch.Tensor:
+    if not fused_combine or num_splits == 1 or needed > _COMBINE_COUNTERS:
+        return _cuda_backend._empty_cuda_tensor(device, torch.int32)
+    counters = _combine_counters.get(device)
+    if counters is None:
+        counters = _combine_counters[device] = torch.zeros(
+            _COMBINE_COUNTERS, dtype=torch.int32, device=device)
+    return counters
+
 
 def is_available(device: torch.device | int | None = None) -> bool:
     """Return whether flash attention decode is available on this GPU."""
@@ -106,7 +123,8 @@ def flash_attention_decode(
         _cuda_backend._C.flash_attention_decode(
             *map(
                 _cuda_backend._wrap_for_dlpack,
-                (query, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum),
+                (query, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum,
+                 _counters(q.device, batch * kv_heads, num_splits)),
             ),
             num_splits,
             torch.cuda.current_stream(q.device).cuda_stream,
@@ -153,7 +171,8 @@ def flash_attention_decode_gqa(
     _cuda_backend._C.flash_attention_decode_gqa(
         *map(
             _cuda_backend._wrap_for_dlpack,
-            (q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum),
+            (q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum,
+             _counters(q.device, batch * (kv_heads if query_length == 1 else heads), num_splits)),
         ),
         num_splits,
         causal,
@@ -171,11 +190,9 @@ def flash_attention_decode_tree_merge(
     """Fold a verify tree's own rows into a prefix-only decode result.
 
     ``out`` [B, S, H*256] and ``lse`` [B, H, S] come from flash_attention_decode_gqa over the
-    committed prefix with causal=False; q [B, H, S, 256] is the rows' own rotated query, k/v
-    [B, Hk, T, 256] the step's rotated keys/values (T >= S: the verify rows themselves, or a draft
-    level merging against the whole tree's side rows), and mask [S] int32 the k/v rows each query
-    row attends inside the step (bit t = k/v row t, including itself). Writes and returns
-    ``merged`` [B, S, H*256]."""
+    committed prefix with causal=False; q [B, H, S, 256] and k/v [B, Hk, S, 256] are the verify
+    rows' own rotated query/key/value, and mask [S] int32 the rows each row attends inside the
+    step (bit t = row t, including itself). Writes and returns ``merged`` [B, S, H*256]."""
     _cuda_backend._C.flash_attention_decode_tree_merge(
         *map(_cuda_backend._wrap_for_dlpack, (out, lse, q, k, v, mask, merged)),
         torch.cuda.current_stream(q.device).cuda_stream,

@@ -11,6 +11,9 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <cooperative_groups.h>
+#include "../prefetch_ring.h"
+
+__device__ PrefetchRingState* g_gated_delta_prefetch_ring = nullptr;
 
 #include "float_utils.cuh"
 #include "dtype_dispatch.cuh"
@@ -137,11 +140,10 @@ __global__ void deltanet_conv_deferred_kernel(
 // the only cross-block value: each block pushes its partial into every sibling's
 // shared memory, one cluster barrier, then sums in fixed rank order.
 // Tree: the S current tokens form a verify tree (parent[r] < r). ctl's program runs the
-// rows in depth-first order; each entry says whether to restore the one saved state copy
-// first, whether this row's update commits into the running state, and whether to save the
-// state after it. A row whose subtree is explored last commits (its parent's state is dead);
-// leaves of a visited parent run with commit = false. The state written to global memory is
-// still only the committed prefix: no current row ever reaches it.
+// rows in depth-first order; each entry says whether this row's update commits into the
+// running state: an argmax-chain row commits, then the leaves hanging off it run against
+// that state with commit = false. The state written to global memory is still only the
+// committed prefix: no current row ever reaches it.
 template <typename T, int DK, int DV, int S, bool Tree>
 __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(256, 2)
 gated_delta_decode_deferred_kernel(
@@ -180,8 +182,6 @@ gated_delta_decode_deferred_kernel(
     __shared__ float red[4 * S][GNW];
     __shared__ float oc[S][COLS];            // bf16-rounded column outputs
     __shared__ float xch[CL][S];             // sibling sums of squares, by rank
-    // tree: one saved copy of the running state, [KPL][NT] so a lane's slice is conflict-free
-    __shared__ float ssave[Tree ? NT * KPL : 1];
     const int head = static_cast<int>(blockIdx.x) / CL;
     const int b = head / Hv;
     const int h = head % Hv;
@@ -205,6 +205,9 @@ gated_delta_decode_deferred_kernel(
     #pragma unroll
     for (int r = 0; r < KPL; ++r)
         st[r] = state[state_off + tile_off + r * DV];
+    // ring consumption: this block's [DK, COLS] fp32 tile of the state, when the host listed it
+    if (t == 0 && g_gated_delta_prefetch_ring != nullptr && (g_gated_delta_prefetch_ring->credits & PREFETCH_RING_CREDIT_DELTA))
+        prefetch_ring_consume_device(g_gated_delta_prefetch_ring, static_cast<uint64_t>(DK) * COLS * sizeof(float));
 
     // gate projections of the current tokens (bf16 projection outputs, bf16 sigmoid,
     // fp32 softplus/exp, as in the eager chain) and the q/k sums of squares
@@ -368,21 +371,10 @@ gated_delta_decode_deferred_kernel(
         state[state_off + tile_off + r * DV] = st[r];
     // current tokens: outputs only, state stays uncommitted until the next step
     if constexpr (Tree) {
-        // prog[e] = row | restore << 4 | commit << 5 | save << 6, in depth-first order
+        // prog[e] = row | commit << 5, in depth-first order
         for (int e = 0; e < S; ++e) {
             const int p = prog[e];
-            const int row = p & 15;
-            if (p & 16) {
-                #pragma unroll
-                for (int r = 0; r < KPL; ++r)
-                    st[r] = ssave[r * NT + t];
-            }
-            step(pending + row, true, row, (p & 32) != 0);
-            if (p & 64) {
-                #pragma unroll
-                for (int r = 0; r < KPL; ++r)
-                    ssave[r * NT + t] = st[r];
-            }
+            step(pending + (p & 15), true, p & 15, (p & 32) != 0);
         }
     } else {
         #pragma unroll
@@ -421,6 +413,10 @@ gated_delta_decode_deferred_kernel(
 }
 
 }  // namespace
+
+extern "C" void set_gated_delta_prefetch_ring_state(PrefetchRingState* state) {
+    cudaMemcpyToSymbol(g_gated_delta_prefetch_ring, &state, sizeof(state));
+}
 
 extern "C" bool launch_gated_delta_decode_deferred(
     const void* x, const void* w_a, const void* w_b, const void* dt_bias, const void* g_decay,

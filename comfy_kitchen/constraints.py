@@ -355,7 +355,7 @@ def na3d_common_call_rule(kwargs):
 
 def w4a8_storage_call_rule(kwargs):
     """Validate conventional 2D or MMA-packed 1D W4A8 storage."""
-    expected_dims = 1 if kwargs.get("mma_packed", False) else 2
+    expected_dims = 1 if kwargs.get("stream_rows", 0) else 2
     for name in ("qdata", "s_rel"):
         tensor = kwargs.get(name)
         if tensor is not None and tensor.dim() != expected_dims:

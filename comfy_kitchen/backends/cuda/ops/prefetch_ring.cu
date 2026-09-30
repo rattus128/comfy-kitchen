@@ -19,27 +19,43 @@ constexpr int kIssuers = PREFETCH_RING_ISSUERS;
 #endif
 constexpr int kIssuerThreads = 32;
 constexpr int kIssueBatch = 8;   // chunks issued per consumed-snapshot
+// Experiment: aggregate issue-rate cap (GB/s) applied once the issuer leads demand by
+// PREFETCH_RING_PACE_LEAD_MIB. Bulk-prefetch fills above ~1.5 TB/s slow every kernel sharing
+// the L2 by 40-100% (fill_penalty.py); below 1.4 TB/s the penalty is under 15%.
+#ifndef PREFETCH_RING_PACE_GBPS
+#define PREFETCH_RING_PACE_GBPS 0
+#endif
+#ifndef PREFETCH_RING_PACE_LEAD_MIB
+#define PREFETCH_RING_PACE_LEAD_MIB 0
+#endif
+constexpr uint64_t kPaceLead = uint64_t(PREFETCH_RING_PACE_LEAD_MIB) << 20;
 PrefetchRingState* g_states[16] = {};
 cudaStream_t g_issue_streams[16] = {};
 cudaEvent_t g_start_events[16] = {};
 
-__global__ void configure_prefetch_ring_kernel(
-    PrefetchRingState* ring, const PrefetchRegion* regions, int count,
-    uint64_t lookahead, uint32_t chunk) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+__device__ uint64_t region_total(const PrefetchRegion* regions, int count) {
     uint64_t total = 0;
     for (int i = 0; i < count; ++i) total += regions[i].bytes;
+    return total;
+}
+
+__global__ void configure_prefetch_ring_kernel(
+    PrefetchRingState* ring, const PrefetchRegion* regions, int count,
+    uint64_t lookahead, uint32_t chunk, uint32_t credits) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
     ring->regions = regions;
     ring->count = count;
-    ring->total = total;
+    ring->total = region_total(regions, count);
     ring->lookahead = lookahead;
     ring->chunk = chunk;
+    ring->credits = credits;
     ring->stalled = 0;
     ring->consumed = 0;
+    ring->next_batch = 0;
     ring->touched = ring->skipped = ring->waited_ns = 0;
     ring->arrived = 0;
     for (int i = 0; i <= kIssuers; ++i) ring->distinct_hist[i] = 0;
-    ring->enabled = count > 0 && total > 0;
+    ring->enabled = count > 0 && ring->total > 0;
 }
 
 __global__ void disable_prefetch_ring_kernel(PrefetchRingState* ring) {
@@ -50,11 +66,24 @@ __global__ void disable_prefetch_ring_kernel(PrefetchRingState* ring) {
 // step (including W4A8 kernels outside the ring scope) has finished, so the
 // step's byte count restarts at zero. Re-arms a ring that was disabled
 // mid-step (a host sync must stop the issuer first; see prefetch_ring_disable).
+// Region byte counts may change between steps (KV rows grow), so the step
+// total is summed here from the descriptors the host updated on `stream`.
 __global__ void reset_prefetch_ring_kernel(PrefetchRingState* ring) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
+        ring->total = region_total(ring->regions, ring->count);
         ring->consumed = 0;
+        ring->next_batch = 0;
         ring->arrived = 0;
+        ring->trace_n = 0;
         ring->enabled = ring->count > 0 && ring->total > 0;
+    }
+}
+
+__global__ void set_prefetch_ring_trace_kernel(PrefetchRingState* ring, uint64_t* trace, uint32_t cap) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        ring->trace = trace;
+        ring->trace_cap = cap;
+        ring->trace_n = 0;
     }
 }
 
@@ -62,6 +91,18 @@ __device__ __forceinline__ uint64_t global_timer() {
     uint64_t t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
+}
+
+__device__ __forceinline__ void trace_record(PrefetchRingState* ring, uint64_t* trace, uint32_t cap,
+                                             uint64_t consumed, uint64_t cursor, uint32_t event) {
+    if (trace == nullptr) return;
+    const uint32_t i = atomicAdd(&ring->trace_n, 1u);
+    if (i >= cap) return;
+    uint64_t* r = trace + static_cast<size_t>(i) * 4;
+    r[0] = global_timer();
+    r[1] = consumed;
+    r[2] = cursor;
+    r[3] = blockIdx.x | (static_cast<uint64_t>(event) << 8);
 }
 
 // Cursor into the concatenated region list; advancing by n bytes walks regions.
@@ -108,16 +149,23 @@ struct RingCursor {
     }
 };
 
-// One thread per CTA; CTA i owns chunks i, i + kIssuers, ... of the step's byte
-// stream. A chunk is requested once it lies within `lookahead` of the consumed
-// position; chunks demand has already consumed are skipped. The kernel ends
-// after requesting `lookahead` bytes past the end of the step (the wrap-around
-// start of the next one).
+// One thread per CTA. The step's byte stream is cut into batches of kIssueBatch
+// chunks that the CTAs claim in order from `next_batch`, so the prefetched
+// frontier is one contiguous run behind the claim counter no matter how
+// unevenly the CTAs progress. (Progress is uneven: bulk prefetch issue is
+// throttled per TPC at ~370 GB/s, so a CTA sharing its TPC with another issuer
+// or with GEMM CTAs runs at ~160 GB/s while one alone on its TPC runs at ~300.
+// With a static interleave the frontier moved at 10x the slowest CTA and the
+// fast ones idled at the window edge.) A chunk is requested once it lies
+// within `lookahead` of the consumed position; chunks demand has already
+// consumed are skipped. The kernel ends after requesting `lookahead` bytes
+// past the end of the step (the wrap-around start of the next one).
 //
-// The loop decides from a snapshot of the racy counters that was loaded while
-// the previous chunk issued, so the fast path has no load latency in it; a
-// stale snapshot only delays a skip or a window advance by one chunk. The
-// counters are polled synchronously only while the window is exhausted.
+// The loop decides from a snapshot of the racy counters, and a batch claim,
+// that were loaded while the previous batch issued, so the fast path has no
+// load latency in it; a stale snapshot only delays a skip or a window advance
+// by one batch. The counters are polled synchronously only while the window
+// is exhausted.
 
 __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(PrefetchRingState* ring) {
     if (threadIdx.x != 0) return;
@@ -140,58 +188,81 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
     const uint64_t end = ring->total;
     const uint64_t lookahead = ring->lookahead;
     const uint64_t chunk = ring->chunk;
-    const uint64_t stride = chunk * gridDim.x;
+    const uint64_t batch = chunk * kIssueBatch;
     volatile uint64_t* consumed_p = &ring->consumed;
     volatile int* enabled_p = &ring->enabled;
+    unsigned long long* next_batch_p = reinterpret_cast<unsigned long long*>(&ring->next_batch);
+    uint64_t* const trace = ring->trace;
+    const uint32_t trace_cap = ring->trace_cap;
 
-    uint64_t cursor = chunk * blockIdx.x;
+    uint64_t cursor = atomicAdd(next_batch_p, 1ull) * batch;   // start of this CTA's batch
     RingCursor pos{ring->regions, ring->count, 0, 0, nullptr, 0};
     pos.load();
     pos.advance(cursor);
 
     uint64_t touched = 0, skipped = 0, waited = 0;
+    // ns per issue batch for this CTA's share of the aggregate cap; 0 = unpaced
+    const uint64_t pace_ns = PREFETCH_RING_PACE_GBPS ? batch * kIssuers / uint64_t(PREFETCH_RING_PACE_GBPS) : 0;
+    uint64_t next_ok = 0;
     uint64_t consumed = *consumed_p;
     int enabled = *enabled_p;
     while (cursor < end + lookahead && enabled) {
-        if (cursor + chunk <= consumed) {
-            // demand already read this: jump to our first chunk at/after the consumed position
-            const uint64_t skip = ((consumed / chunk) * chunk - cursor + stride - 1) / stride * stride;
-            cursor += skip;
-            pos.advance(skip);
-            skipped += skip / gridDim.x;
-            continue;
-        }
-        if (cursor >= consumed + lookahead) {
-            const uint64_t t0 = global_timer();
-            do {
-                __nanosleep(256);
-                waited += 256;
-                consumed = *consumed_p;
-                enabled = *enabled_p;
-                if (!enabled) break;
-                if (global_timer() - t0 > 100000000ull) {   // 100 ms without consumption
-                    atomicAdd(&ring->stalled, 1u);
-                    enabled = 0;
-                    break;
-                }
-            } while (cursor >= consumed + lookahead);
-            continue;   // re-evaluate against the fresh snapshot
-        }
-        // Issue a batch of chunks against the current snapshot. The refreshed
-        // snapshot is loaded first and only read after the batch, so its L2
-        // round trip (which grows under GEMM hit traffic) overlaps the issues
-        // instead of gating each one: one dependent load per chunk capped the
-        // issuer at ~1.2 TB/s during GEMMs.
+        // Claim the next batch and refresh the snapshot first; both are only
+        // read after this batch issued, so their L2 round trips (which grow
+        // under GEMM hit traffic) overlap the issues instead of gating them:
+        // one dependent load per chunk capped the issuer at ~1.2 TB/s during
+        // GEMMs.
+        const uint64_t next_cursor = atomicAdd(next_batch_p, 1ull) * batch;
         const uint64_t next_consumed = *consumed_p;
         const int next_enabled = *enabled_p;
-        const uint64_t cap = consumed + lookahead < end + lookahead ? consumed + lookahead : end + lookahead;
-        for (int k = 0; k < kIssueBatch && cursor < cap; ++k) {
-            pos.prefetch(chunk);
-            touched += chunk;
-            pos.advance(stride - chunk);
-            cursor += stride;
+        const uint64_t batch_end = cursor + batch < end + lookahead ? cursor + batch : end + lookahead;
+        // chunks demand already read are skipped; the rest are issued once inside the window
+        const uint64_t from = cursor > consumed ? cursor : (consumed / chunk * chunk < batch_end ? consumed / chunk * chunk : batch_end);
+        skipped += from - cursor;
+        trace_record(ring, trace, trace_cap, consumed, cursor,
+                     from == batch_end ? PREFETCH_RING_TRACE_SKIP : PREFETCH_RING_TRACE_ISSUE);
+        pos.advance(from - cursor);
+        if (pace_ns != 0) {
+            // token bucket: paced only while comfortably ahead of demand, so an empty
+            // ring still fills at full speed
+            const uint64_t now = global_timer();
+            if (from > consumed + kPaceLead) {
+                uint64_t t = now;
+                while (t < next_ok) {
+                    __nanosleep(128);
+                    t = global_timer();
+                }
+                next_ok = (next_ok > now ? next_ok : now) + pace_ns;
+            } else {
+                next_ok = now + pace_ns;
+            }
         }
-        consumed = next_consumed;
+        for (uint64_t c = from; c < batch_end; c += chunk) {
+            if (c >= consumed + lookahead) {
+                const uint64_t t0 = global_timer();
+                do {
+                    __nanosleep(256);
+                    waited += 256;
+                    consumed = *consumed_p;
+                    enabled = *enabled_p;
+                    if (!enabled) break;
+                    if (global_timer() - t0 > 100000000ull) {   // 100 ms without consumption
+                        atomicAdd(&ring->stalled, 1u);
+                        enabled = 0;
+                        break;
+                    }
+                } while (c >= consumed + lookahead);
+                trace_record(ring, trace, trace_cap, consumed, c, PREFETCH_RING_TRACE_WAIT);
+                if (!enabled) break;
+            }
+            const uint64_t n = c + chunk < batch_end ? chunk : batch_end - c;
+            pos.prefetch(n);
+            touched += n;
+        }
+        if (!enabled) break;
+        pos.advance(next_cursor - batch_end);
+        cursor = next_cursor;
+        consumed = next_consumed > consumed ? next_consumed : consumed;
         enabled = next_enabled;
     }
     atomicAdd(reinterpret_cast<unsigned long long*>(&ring->touched), touched);
@@ -219,6 +290,9 @@ PrefetchRingState* current_state(int* device_out) {
                              cudaFuncAttributePreferredSharedMemoryCarveout,
                              PREFETCH_RING_ISSUER_CARVEOUT);
         set_w4a8_prefetch_ring_state(g_states[device]);
+        set_int8_prefetch_ring_state(g_states[device]);
+        set_flash_prefetch_ring_state(g_states[device]);
+        set_gated_delta_prefetch_ring_state(g_states[device]);
     }
     if (device_out) *device_out = device;
     return g_states[device];
@@ -235,12 +309,12 @@ bool prefetch_ring_is_available() {
 }
 
 extern "C" void launch_prefetch_ring_configure(
-    const uint64_t* regions, int count, uint64_t lookahead, uint32_t chunk,
+    const uint64_t* regions, int count, uint64_t lookahead, uint32_t chunk, uint32_t credits,
     cudaStream_t stream) {
     PrefetchRingState* state = current_state(nullptr);
     if (state == nullptr) return;
     configure_prefetch_ring_kernel<<<1, 1, 0, stream>>>(
-        state, reinterpret_cast<const PrefetchRegion*>(regions), count, lookahead, chunk);
+        state, reinterpret_cast<const PrefetchRegion*>(regions), count, lookahead, chunk, credits);
 }
 
 extern "C" void launch_prefetch_ring_disable(cudaStream_t stream) {
@@ -259,6 +333,11 @@ extern "C" void launch_prefetch_ring_start(cudaStream_t stream) {
     cudaEventRecord(g_start_events[device], stream);
     cudaStreamWaitEvent(g_issue_streams[device], g_start_events[device], 0);
     prefetch_ring_issuer_kernel<<<kIssuers, kIssuerThreads, 0, g_issue_streams[device]>>>(state);
+}
+
+extern "C" void launch_prefetch_ring_set_trace(uint64_t* trace, uint32_t cap, cudaStream_t stream) {
+    PrefetchRingState* state = current_state(nullptr);
+    if (state != nullptr) set_prefetch_ring_trace_kernel<<<1, 1, 0, stream>>>(state, trace, cap);
 }
 
 // Diagnostic: synchronous copy of the state counters.

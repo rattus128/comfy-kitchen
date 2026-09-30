@@ -184,20 +184,18 @@ class TestGatedDeltaDeferred:
                         ref_state, z[:, :pending], norm_w, pending)
             parity ^= 1
 
-    # M = 8 "symmetric tree-2 + 3 straight": rows c(0), d1(1), d2(2), d3(3) chain; a1(4) sibling
-    # of d1; a2(5) sibling of d2; b1(6), b2(7) children of a1. Depth-first program: the d-chain
-    # runs first from c (a2 is a leaf, so it does not commit), then the saved c state is restored
-    # for a1 (whose own children are leaves, so a1 commits).
-    TREE_PARENT = [-1, 0, 1, 2, 0, 1, 4, 4]
+    # M = 7 "tree2s2": rows c(0), d1(1), d2(2) chain; a1(5), a2(6) runner-up siblings of d1;
+    # b1(3), b2(4) runner-up siblings of d2 (rows numbered depth-first). Program: a chain row
+    # commits, then the leaves hanging off it run against that state without committing.
+    TREE_PARENT = [-1, 0, 1, 1, 1, 0, 0]
     TREE_PROG = [
-        0 | 32 | 64,   # c: commit, save
+        0 | 32,        # c: commit
+        5,             # a1: leaf off c
+        6,             # a2: leaf off c
         1 | 32,        # d1: commit
-        5,             # a2: leaf off d1
-        2 | 32,        # d2: commit
-        3 | 32,        # d3: commit
-        4 | 16 | 32,   # a1: restore c, commit
-        6,             # b1: leaf off a1
-        7,             # b2: leaf off a1
+        3,             # b1: leaf off d1
+        4,             # b2: leaf off d1
+        2,             # d2: last chain row, nothing hangs off it
     ]
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -258,8 +256,8 @@ class TestGatedDeltaDeferred:
                               g_decay, ref_state.clone(), z[:, rows], norm_w, len(rows))
             assert rel_err(got[:, r].float(), ref[:, -1].float()) < tol, f"tree step: row {r}"
 
-        # step 2: commit the accepted path c -> a1 -> b2 (rows 0, 4, 7), then verify 3 plain tokens
-        accepted = [0, 4, 7]
+        # step 2: commit the accepted path c -> d1 -> b2 (rows 0, 1, 4), then verify 3 plain tokens
+        accepted = [0, 1, 4]
         _eager_step(proj[:, accepted], ref_conv_state, w, b, x[:, accepted], w_a, w_b, dt_bias, g_decay,
                     ref_state, z[:, accepted], norm_w, len(accepted))
         seq = 3

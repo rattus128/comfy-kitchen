@@ -7,12 +7,11 @@ from .backends import cuda as _cuda_backend
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
+from .backends.cuda import rms_rope_kv_decode, rms_rope_kv_decode_is_available
+from .backends.cuda import w4a8_quantize_input, w4a8_int8_linear_prequantized
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
-from .backends.eager.w4a8_int8 import (
-    pack_w4a8_mma_weight,
-    unpack_w4a8_mma_weight,
-)
+from .tensor.w4a8_stream import pack_w4a8_mma_weight, unpack_w4a8_mma_weight, w4a8_mma_stream_rows
 from .exceptions import (
     BackendError,
     BackendNotFoundError,
@@ -28,8 +27,6 @@ from .prefetch_ring import (
     configure as configure_prefetch_ring,
     disable as disable_prefetch_ring,
     is_available as prefetch_ring_is_available,
-    record_region as record_prefetch_region,
-    set_record_region as set_prefetch_ring_recorder,
     start as start_prefetch_ring,
 )
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
@@ -37,7 +34,7 @@ from .gated_delta import is_available as gated_delta_decode_is_available
 from .gated_delta import deferred_is_available as gated_delta_deferred_is_available
 from .gated_delta import deferred_buffers as gated_delta_deferred_buffers
 from .gated_delta import deltanet_conv_step_deferred, gated_delta_decode_deferred
-from .gated_delta import CTL_INTS as gated_delta_ctl_ints
+from .gated_delta import CTL_INTS as gated_delta_ctl_ints, SLOT_MAX as gated_delta_slot_max
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
@@ -95,12 +92,15 @@ __all__ = [
     "deltanet_conv_step_deferred",
     "gated_delta_decode_deferred",
     "gated_delta_ctl_ints",
+    "gated_delta_slot_max",
     "flash_attention_decode_is_available",
+    "rms_rope_kv_decode",
+    "rms_rope_kv_decode_is_available",
+    "w4a8_quantize_input",
+    "w4a8_int8_linear_prequantized",
     "configure_prefetch_ring",
     "disable_prefetch_ring",
     "prefetch_ring_is_available",
-    "record_prefetch_region",
-    "set_prefetch_ring_recorder",
     "start_prefetch_ring",
     "na2d",
     "na3d",
@@ -119,6 +119,7 @@ __all__ = [
     "quantize_w4a8_int8_weight",
     "pack_w4a8_mma_weight",
     "unpack_w4a8_mma_weight",
+    "w4a8_mma_stream_rows",
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
     "dequantize_int8_simple",

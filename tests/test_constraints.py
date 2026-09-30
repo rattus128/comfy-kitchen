@@ -61,20 +61,20 @@ class TestShapeRules:
 
 
 @pytest.mark.parametrize(
-    ("mma_packed", "qdata_shape", "scale_shape", "expected"),
+    ("stream_rows", "qdata_shape", "scale_shape", "expected"),
     [
-        (False, (16, 128), (16, 16), True),
-        (True, (2304,), (0,), True),
-        (False, (2304,), (0,), False),
-        (True, (16, 128), (16, 16), False),
+        (0, (16, 128), (16, 16), True),
+        (8, (2304,), (0,), True),
+        (0, (2304,), (0,), False),
+        (8, (16, 128), (16, 16), False),
     ],
 )
-def test_w4a8_storage_call_rule(mma_packed, qdata_shape, scale_shape, expected):
+def test_w4a8_storage_call_rule(stream_rows, qdata_shape, scale_shape, expected):
     result = w4a8_storage_call_rule(
         {
             "qdata": torch.empty(qdata_shape, dtype=torch.int8),
             "s_rel": torch.empty(scale_shape, dtype=torch.float8_e4m3fn),
-            "mma_packed": mma_packed,
+            "stream_rows": stream_rows,
         }
     )
     assert result.success is expected
