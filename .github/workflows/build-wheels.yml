@@ -17,6 +17,7 @@ permissions:
 jobs:
   build_wheels_linux:
     name: Build Linux wheels
+    if: github.ref != 'refs/heads/dev/prefetch-handoff-20260930'
     runs-on: ubuntu-22.04
 
     steps:
@@ -227,6 +228,7 @@ jobs:
 
   build_wheels_linux_arm64:
     name: Build Linux ARM64 wheels
+    if: github.ref != 'refs/heads/dev/prefetch-handoff-20260930'
     runs-on: ubuntu-22.04-arm
 
     steps:
@@ -351,6 +353,7 @@ jobs:
 
   build_wheels_windows:
     name: Build Windows wheel (Python ${{ matrix.python-version }})
+    if: github.ref != 'refs/heads/dev/prefetch-handoff-20260930'
     runs-on: windows-2022
     strategy:
       matrix:
@@ -734,6 +737,7 @@ jobs:
           # -log / -loglevel:6 writes verbose NVIDIA installer logs for first-run debugging.
           $packages = @(
             "nvcc_13.4",
+            "cuobjdump_13.4",
             "cudart_13.4",
             "crt_13.4",
             "cublas_13.4",
@@ -896,14 +900,60 @@ jobs:
 
       - name: Build CUDA abi3 wheel
         env:
-          COMFY_CUDA_ARCHS: "120f"
+          COMFY_CUDA_ARCHS: "121-real"
         shell: bash
         run: |
           set -x
           # Python 3.12 produces the cp312-abi3 wheel (covers 3.12+).
-          # WoA / RTX Spark targets Blackwell (SM 120). Keep the arch set narrow
-          # so the 4-core windows-11-arm runners stay within CI time budgets.
+          # Native SM121 avoids PTX JIT on the Spark's older CUDA 13.1 driver.
           python setup.py bdist_wheel -v
+
+      - name: Set up Python 3.13 for wheel verification
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify installed ARM64 wheel and Qwen prefetch exports
+        shell: bash
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pefile dist/*.whl
+          python -I - <<'PY'
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+          import pefile
+          import comfy_kitchen as ck
+          from comfy_kitchen import prefetch_ring
+          from comfy_kitchen.backends.cuda import _C
+
+          required = (
+              "configure_prefetch_ring disable_prefetch_ring start_prefetch_ring "
+              "prefetch_ring_is_available prefetch_ring deltanet_conv_step_deferred "
+              "flash_attention_decode_gqa flash_attention_decode_tree_merge "
+              "gated_delta_ctl_ints gated_delta_decode_deferred gated_delta_deferred_buffers "
+              "gated_delta_slot_max rms_rope_kv_decode rms_rope_kv_decode_is_available"
+          ).split()
+          for name in required:
+              assert hasattr(ck, name), name
+          for name in ("CREDIT_DELTA", "CREDIT_KV", "set_trace"):
+              assert hasattr(prefetch_ring, name), name
+          pyd = Path(_C.__file__)
+          pe = pefile.PE(str(pyd))
+          assert pe.FILE_HEADER.Machine == 0xAA64, "extension is not ARM64"
+          imports = {entry.dll.decode().lower() for entry in pe.DIRECTORY_ENTRY_IMPORT}
+          assert "python3.dll" in imports, imports
+          assert not any(re.fullmatch(r"python3\d+\.dll", dll) for dll in imports), imports
+          listing = subprocess.check_output(
+              [str(Path(os.environ["CUDA_PATH"]) / "bin/cuobjdump.exe"), "--list-elf", str(pyd)],
+              text=True,
+          )
+          print(listing)
+          assert "sm_121" in listing, "native SM121 cubins missing"
+          print("Installed wheel:", ck.__file__)
+          print("Qwen prefetch exports, ARM64, stable ABI, and native SM121 verified")
+          PY
 
       - name: Report compiler-cache statistics
         if: always()
