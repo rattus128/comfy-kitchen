@@ -2190,18 +2190,29 @@ extern "C" {
 
     void launch_quantize_int8_rowwise_convrot64_kernel(
         const void* input,
+        const void* act_up,
         void* output,
         void* scales,
         int64_t num_rows,
         int64_t num_cols,
+        int64_t input_row_stride,
+        int64_t up_row_stride,
         int group_size,
         int input_dtype_code,
         bool stochastic,
         int act_code,
         uint64_t seed,
         const void* act_weight,
+        const void* act_scale,
+        const void* act_shift,
+        int act_weight_dtype_code,
         float act_eps,
         cudaStream_t stream);
+
+    void launch_rms_gated_residual_bf16_kernel(
+        const void* activation, const void* norm_weight,
+        const void* residual, const void* gate, void* output,
+        int rows, int width, float eps, cudaStream_t stream);
 
     void launch_dequantize_int8_linear_kernel(
         const void* input,
@@ -3402,17 +3413,45 @@ void quantize_int8_rowwise_convrot64(
     int64_t act_code,
     uint64_t seed,
     nb::ndarray<nb::device::cuda> act_weight,
+    nb::ndarray<nb::device::cuda> act_scale,
+    nb::ndarray<nb::device::cuda> act_shift,
     double act_eps,
-    uintptr_t stream_ptr) {
+    uintptr_t stream_ptr,
+    nb::object act_up_obj) {
 
     const int64_t M = input.shape(0);
     // K is the activated (quantized) row width; the SwiGLU pair reads a
     // [gate | up] input row twice as wide.
     const int64_t K = output.shape(1);
-    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    const bool has_act_up = !act_up_obj.is_none();
+    nb::ndarray<nb::device::cuda> act_up;
+    if (has_act_up) {
+        act_up = nb::cast<nb::ndarray<nb::device::cuda>>(act_up_obj);
+    }
+    const int64_t in_width = (act_code == comfy::kActSwiGLU && !has_act_up) ? 2 : 1;
 
     if (output.shape(0) != M || input.shape(1) != K * in_width) {
         throw std::runtime_error("INT8 rowwise convrot64 output shape mismatch");
+    }
+    if (input.stride(1) != 1) {
+        throw std::runtime_error("INT8 rowwise convrot64 input must have last stride 1");
+    }
+    if (has_act_up) {
+        if (act_code != comfy::kActSwiGLU) {
+            throw std::runtime_error("INT8 rowwise convrot64 act_up requires SwiGLU");
+        }
+        if (act_up.ndim() != 2 || act_up.shape(0) != M || act_up.shape(1) != K) {
+            throw std::runtime_error("INT8 rowwise convrot64 act_up shape must match the gate input");
+        }
+        if (act_up.stride(1) != 1) {
+            throw std::runtime_error("INT8 rowwise convrot64 act_up must have last stride 1");
+        }
+        if (map_dtype_to_code(act_up.dtype()) != map_dtype_to_code(input.dtype())) {
+            throw std::runtime_error("INT8 rowwise convrot64 act_up dtype must match the gate input");
+        }
+        if (act_up.device_id() != input.device_id()) {
+            throw std::runtime_error("INT8 rowwise convrot64 act_up device must match the gate input");
+        }
     }
     if (scales.shape(0) != M || scales.shape(1) != 1) {
         throw std::runtime_error("INT8 rowwise convrot64 scale shape mismatch");
@@ -3422,30 +3461,81 @@ void quantize_int8_rowwise_convrot64(
         throw std::runtime_error("Unsupported input dtype for INT8 rowwise convrot64 quantization");
     }
     const bool has_act_weight = act_weight.data() && act_weight.size() > 0;
+    const int act_weight_dtype_code = has_act_weight ? map_dtype_to_code(act_weight.dtype()) : input_dtype_code;
+    const bool has_act_scale = act_scale.data() && act_scale.size() > 0;
+    const bool has_act_shift = act_shift.data() && act_shift.size() > 0;
     if (act_code == comfy::kActRmsNorm) {
         if (!has_act_weight || act_weight.size() != K) {
             throw std::runtime_error("INT8 rowwise convrot64 rms_norm weight must have K elements");
         }
-        if (map_dtype_to_code(act_weight.dtype()) != input_dtype_code) {
-            throw std::runtime_error("INT8 rowwise convrot64 rms_norm weight dtype must match the input");
+        if (act_weight_dtype_code < 0 || act_weight_dtype_code > 2) {
+            throw std::runtime_error("INT8 rowwise convrot64 rms_norm weight has unsupported dtype");
         }
     }
-
+    auto validate_modulation = [&](const nb::ndarray<nb::device::cuda>& value,
+                                   bool present, const char* name) {
+        if (!present) return;
+        if (act_code != comfy::kActRmsNorm || value.size() != K) {
+            throw std::runtime_error(std::string("INT8 rowwise convrot64 ") + name +
+                                     " requires rms_norm and K elements");
+        }
+        if (map_dtype_to_code(value.dtype()) != input_dtype_code) {
+            throw std::runtime_error(std::string("INT8 rowwise convrot64 ") + name +
+                                     " dtype must match the input");
+        }
+    };
+    validate_modulation(act_scale, has_act_scale, "rms_norm scale");
+    validate_modulation(act_shift, has_act_shift, "rms_norm shift");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_rowwise_convrot64_kernel(
         input.data(),
+        has_act_up ? act_up.data() :
+            static_cast<const char*>(input.data()) + K * input.itemsize(),
         output.data(),
         scales.data(),
         M,
         K,
+        input.stride(0),
+        has_act_up ? act_up.stride(0) : input.stride(0),
         static_cast<int>(group_size),
         input_dtype_code,
         stochastic,
         static_cast<int>(act_code),
         seed,
         has_act_weight ? act_weight.data() : nullptr,
+        has_act_scale ? act_scale.data() : nullptr,
+        has_act_shift ? act_shift.data() : nullptr,
+        act_weight_dtype_code,
         static_cast<float>(act_eps),
         stream);
+}
+
+void rms_gated_residual_bf16(
+    nb::ndarray<nb::device::cuda> activation,
+    nb::ndarray<nb::device::cuda> norm_weight,
+    nb::ndarray<nb::device::cuda> residual,
+    nb::ndarray<nb::device::cuda> gate,
+    nb::ndarray<nb::device::cuda> output,
+    int rows, int width, double eps, uintptr_t stream_ptr) {
+    const nb::ndarray<nb::device::cuda>* operands[] = {
+        &activation, &norm_weight, &residual, &gate, &output};
+    const int64_t lengths[] = {
+        static_cast<int64_t>(rows) * width, width,
+        static_cast<int64_t>(rows) * width, width,
+        static_cast<int64_t>(rows) * width};
+    if (rows < 0 || width <= 0 || width % 4 != 0) {
+        throw std::runtime_error("rms_gated_residual_bf16 requires non-negative rows and positive width divisible by 4");
+    }
+    for (int i = 0; i < 5; ++i) {
+        if (map_dtype_to_code(operands[i]->dtype()) != 2 ||
+            static_cast<int64_t>(operands[i]->size()) != lengths[i]) {
+            throw std::runtime_error("rms_gated_residual_bf16 operand dtype or size mismatch");
+        }
+    }
+    launch_rms_gated_residual_bf16_kernel(
+        activation.data(), norm_weight.data(), residual.data(), gate.data(),
+        output.data(), rows, width, static_cast<float>(eps),
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 void dequantize_int8_linear(
@@ -3616,16 +3706,22 @@ void int8_linear_m1(
     if (convrot) {
         launch_quantize_int8_rowwise_convrot64_kernel(
             input.data(),
+            /*act_up=*/nullptr,
             q_scratch.data(),
             x_scales.data(),
             M,
             K,
+            input.stride(0),
+            input.stride(0),
             group_size,
             input_dtype_code,
             false,
             /*act_code=*/0,
             0,
             /*act_weight=*/nullptr,
+            /*act_scale=*/nullptr,
+            /*act_shift=*/nullptr,
+            /*act_weight_dtype_code=*/input_dtype_code,
             /*act_eps=*/0.0f,
             stream);
     } else {
@@ -4186,8 +4282,8 @@ NB_MODULE(_C, m) {
           "codes in input_act_codes.h: none, gelu tanh-approx, swiglu, "
           "rms_norm), folding it into the quantizer instead of round-tripping "
           "it through HBM. rms_norm "
-          "reads its K-element weight from act_weight (same dtype as the "
-          "input; pass an empty tensor otherwise) and eps from act_eps.",
+          "reads its K-element weight from act_weight in that tensor's own "
+          "floating-point dtype (pass an empty tensor otherwise) and eps from act_eps.",
           nb::arg("input"),
           nb::arg("output"),
           nb::arg("scales"),
@@ -4196,7 +4292,16 @@ NB_MODULE(_C, m) {
           nb::arg("act_code"),
           nb::arg("seed"),
           nb::arg("act_weight"),
+          nb::arg("act_scale"),
+          nb::arg("act_shift"),
           nb::arg("act_eps"),
+          nb::arg("stream_ptr"),
+          nb::arg("act_up") = nb::none());
+
+    m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16,
+          nb::arg("activation"), nb::arg("norm_weight"),
+          nb::arg("residual"), nb::arg("gate"), nb::arg("output"),
+          nb::arg("rows"), nb::arg("width"), nb::arg("eps"),
           nb::arg("stream_ptr"));
 
     m.def("dequantize_int8_linear", &dequantize_int8_linear,

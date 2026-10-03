@@ -55,8 +55,11 @@ bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void
                                int, int, int, int, hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
-void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
-                                         int, int, const void*, float, hipStream_t);
+void launch_quantize_int8_convrot_kernel(const void*, const void*, int64_t, int64_t, int, void*, void*, void*, void*, int, int,
+                                         int, int, const void*, float, bool, const void*, const void*, int,
+                                         hipStream_t);
+void launch_norm_convrot_quant_kernel(const void*, const void*, const void*, int, const void*, int,
+                                      void*, void*, int, int, float, int, bool, hipStream_t);
 void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void*, int64_t,
                                             hipStream_t);
 void launch_dequantize_int8_simple_kernel(const void*, const void*, void*, int64_t, int64_t, int,
@@ -186,6 +189,19 @@ static void require_dtype(const nb::ndarray<>& t, int lo, int hi, const char* fn
     const int code = map_dtype_to_code(t.dtype());
     if (code < lo || code > hi) {
         throw std::runtime_error(std::string(fn) + ": " + name + " has an unsupported dtype");
+    }
+}
+
+// Kernels that synthesize strides from extents instead of reading tensor strides
+// require packed row-major operands, including views passed directly to _C.
+static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, const char* name) {
+    int64_t expected = 1;
+    for (int axis = static_cast<int>(t.ndim()) - 1; axis >= 0; --axis) {
+        if (t.shape(axis) != 1 && t.stride(axis) != expected) {
+            throw std::runtime_error(std::string(fn) + ": " + name +
+                                     " must be contiguous in the packed layout");
+        }
+        expected *= static_cast<int64_t>(t.shape(axis));
     }
 }
 
@@ -366,6 +382,85 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
     check_hip_launch();
 }
 
+void rms_gated_residual_bf16(
+    nb::ndarray<> activation, nb::ndarray<> norm_weight,
+    nb::ndarray<> residual, nb::ndarray<> gate, nb::ndarray<> output,
+    int rows, int width, float eps, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "rms_gated_residual_bf16";
+    require_nonneg(rows, kFn, "rows");
+    if (width <= 0 || width % 4 != 0) {
+        throw std::runtime_error(
+            std::string(kFn) + ": width must be positive and divisible by 4");
+    }
+    require_dtype(activation, 2, 2, kFn, "activation");
+    require_dtype(norm_weight, 2, 2, kFn, "norm_weight");
+    require_dtype(residual, 2, 2, kFn, "residual");
+    require_dtype(gate, 2, 2, kFn, "gate");
+    require_dtype(output, 2, 2, kFn, "output");
+    const int64_t numel = static_cast<int64_t>(rows) * width;
+    require_len(activation, numel, kFn, "activation");
+    require_len(norm_weight, width, kFn, "norm_weight");
+    require_len(residual, numel, kFn, "residual");
+    require_len(gate, width, kFn, "gate");
+    require_len(output, numel, kFn, "output");
+    require_packed_contiguous(activation, kFn, "activation");
+    require_packed_contiguous(norm_weight, kFn, "norm_weight");
+    require_packed_contiguous(residual, kFn, "residual");
+    require_packed_contiguous(gate, kFn, "gate");
+    require_packed_contiguous(output, kFn, "output");
+    const nb::ndarray<>* vector_operands[] = {
+        &activation, &norm_weight, &residual, &gate, &output};
+    for (const nb::ndarray<>* operand : vector_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
+
+    launch_rms_gated_residual_bf16_kernel(
+        activation.data(), norm_weight.data(), residual.data(), gate.data(),
+        output.data(), rows, width, eps,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void int8_gemm_tiled128(
+    nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
+    nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
+    OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "int8_gemm_tiled128";
+    if (scale_b_stride != 0 && scale_b_stride != 1) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": scale_b_stride must be 0 or 1");
+    }
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    if (N <= 0 || K <= 0 || N % 128 != 0 || K % 128 != 0) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": requires positive N and K divisible by 128");
+    }
+    require_dtype(a, 4, 4, kFn, "a");
+    require_dtype(b, 4, 4, kFn, "b");
+    require_dtype(c, 0, 2, kFn, "c");
+    require_out_matches(c, out_code, kFn);
+    const int64_t padded_m = (static_cast<int64_t>(M) + 127) / 128 * 128;
+    require_len(a, padded_m * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(c, static_cast<int64_t>(M) * N, kFn, "c");
+    require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
+    require_scale_len(scale_b, scale_b_stride == 1 ? static_cast<size_t>(N) : 1,
+                      kFn, "scale_b");
+    require_bias(bias, N, kFn);
+
+    launch_int8_gemm_tiled128_kernel(
+        a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
+        scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N,
+        out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 void convrot_w4a4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> x_scale,
                        nb::ndarray<> w_scale, OptArray bias, int M, int N, int K, int out_code,
                        uintptr_t stream_ptr) {
@@ -516,11 +611,14 @@ void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 }
 
 // act_code folds an activation into the rotation's load. rms_norm (code 3) reads a
-// K-element act_weight in x's dtype and act_eps.
+// K-element act_weight in its own dtype and act_eps.
 void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
                            OptArray spill_rotated, OptArray spill_partials, int M, int K,
                            int group_size, int act_code, uintptr_t stream_ptr,
-                           OptArray act_weight = std::nullopt, float act_eps = 0.0f) {
+                           OptArray act_weight = std::nullopt, float act_eps = 0.0f,
+                           bool tiled_output = false, OptArray act_scale = std::nullopt,
+                           OptArray act_shift = std::nullopt,
+                           OptArray act_up = std::nullopt) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
     require_convrot_group(K, group_size, kFn);
@@ -528,10 +626,53 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_dtype(q, 4, 4, kFn, "q");
     // K is the activated (written) width; swiglu (code 2, see INPUT_ACT_TO_CODE)
     // reads a [gate | up] row twice as wide. The launcher rejects unknown codes.
-    const int64_t in_width = act_code == 2 ? 2 : 1;
-    require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
-    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    if (act_up.has_value() && act_code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": act_up is only valid for SwiGLU");
+    }
+    int64_t x_row_stride = act_code == 2 && !act_up.has_value() ? 2 * K : K;
+    int64_t up_row_stride = x_row_stride;
+    const void* up_ptr = nullptr;
+    if (act_code == 2 && act_up.has_value()) {
+        if (x.ndim() != 2 || act_up->ndim() != 2 || x.shape(0) != static_cast<size_t>(M) ||
+            x.shape(1) != static_cast<size_t>(K) || act_up->shape(0) != static_cast<size_t>(M) ||
+            act_up->shape(1) != static_cast<size_t>(K)) {
+            throw std::runtime_error(std::string(kFn) + ": split SwiGLU operands must have shape [M, K]");
+        }
+        if (x.dtype() != act_up->dtype()) {
+            throw std::runtime_error(std::string(kFn) + ": act_up dtype must match x");
+        }
+        if (x.device_type() != nb::device::rocm::value ||
+            act_up->device_type() != x.device_type() || act_up->device_id() != x.device_id()) {
+            throw std::runtime_error(std::string(kFn) + ": split SwiGLU operands must be on the same HIP device");
+        }
+        if (x.stride(1) != 1 || act_up->stride(1) != 1 || x.stride(0) <= 0 || act_up->stride(0) <= 0) {
+            throw std::runtime_error(std::string(kFn) + ": split SwiGLU operands require stride[-1] == 1 and positive row strides");
+        }
+        x_row_stride = x.stride(0);
+        up_row_stride = act_up->stride(0);
+        up_ptr = act_up->data();
+    } else {
+        const int64_t in_width = act_code == 2 ? 2 : 1;
+        require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
+        require_packed_contiguous(x, kFn, "x");
+        if (act_code == 2) {
+            up_ptr = static_cast<const char*>(x.data()) +
+                static_cast<int64_t>(K) * (x.dtype().bits / 8);
+        }
+    }
+    const int64_t q_rows = tiled_output ? (static_cast<int64_t>(M) + 127) / 128 * 128 : M;
+    require_len(q, q_rows * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
+    // scales is written one float per row, so a row slice of it needs no alignment.
+    const nb::ndarray<>* aligned_operands[] = {&x, &q};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
 
     void* spill_rotated_ptr = nullptr;
     void* spill_partials_ptr = nullptr;
@@ -541,28 +682,89 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
         if (map_dtype_to_code(spill_rotated->dtype()) != map_dtype_to_code(x.dtype())) {
             throw std::runtime_error(std::string(kFn) + ": spill_rotated dtype must match x");
         }
+        require_packed_contiguous(*spill_rotated, kFn, "spill_rotated");
         spill_rotated_ptr = spill_rotated->data();
     }
     if (spill_partials.has_value()) {
         require_dtype(*spill_partials, 0, 0, kFn, "spill_partials");
         require_len(*spill_partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
+        require_packed_contiguous(*spill_partials, kFn, "spill_partials");
         spill_partials_ptr = spill_partials->data();
     }
     if (act_code == 3) {
         if (!act_weight.has_value()) {
             throw std::runtime_error(std::string(kFn) + ": rms_norm requires act_weight");
         }
-        if (map_dtype_to_code(act_weight->dtype()) != map_dtype_to_code(x.dtype())) {
-            throw std::runtime_error(std::string(kFn) + ": act_weight dtype must match x");
-        }
+        require_dtype(*act_weight, 0, 2, kFn, "act_weight");
         require_len(*act_weight, K, kFn, "act_weight");
+        require_packed_contiguous(*act_weight, kFn, "act_weight");
+        if (reinterpret_cast<uintptr_t>(act_weight->data()) % 8 != 0) {
+            throw std::runtime_error(std::string(kFn) + ": act_weight must be 8-byte aligned");
+        }
+    }
+    for (const OptArray* modulation : {&act_scale, &act_shift}) {
+        if (!modulation->has_value()) continue;
+        if (act_code != 3) {
+            throw std::runtime_error(std::string(kFn) + ": scale/shift require rms_norm");
+        }
+        require_dtype(**modulation, 2, 2, kFn, "scale/shift");
+        require_len(**modulation, K, kFn, "scale/shift");
+        require_packed_contiguous(**modulation, kFn, "scale/shift");
+        if (reinterpret_cast<uintptr_t>((*modulation)->data()) % 8 != 0) {
+            throw std::runtime_error(std::string(kFn) + ": scale/shift must be 8-byte aligned");
+        }
     }
 
-    launch_quantize_int8_convrot_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
+    launch_quantize_int8_convrot_kernel(x.data(), up_ptr, x_row_stride, up_row_stride,
+                                        map_dtype_to_code(x.dtype()), q.data(),
                                         scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
                                         group_size, act_code,
                                         act_code == 3 ? act_weight->data() : nullptr, act_eps,
+                                        tiled_output, act_scale ? act_scale->data() : nullptr,
+                                        act_shift ? act_shift->data() : nullptr,
+                                        act_code == 3 ? map_dtype_to_code(act_weight->dtype()) : -1,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void norm_convrot_quant(
+    nb::ndarray<> x, OptArray weight, OptArray scale, OptArray shift,
+    nb::ndarray<> q, nb::ndarray<> scales, int M, int K, float eps,
+    int norm_kind, bool tiled_output, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "norm_convrot_quant";
+    require_nonneg(M, kFn, "M");
+    if (K <= 0 || K % 256 != 0 || (norm_kind != 0 && norm_kind != 1))
+        throw std::runtime_error(std::string(kFn) + ": invalid shape or norm kind");
+    require_dtype(x, 2, 2, kFn, "x");
+    require_dtype(q, 4, 4, kFn, "q");
+    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    const int64_t q_rows = tiled_output ? (static_cast<int64_t>(M) + 127) / 128 * 128 : M;
+    require_len(q, q_rows * K, kFn, "q");
+    require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
+    if (norm_kind == 0) {
+        if (!weight) throw std::runtime_error(std::string(kFn) + ": RMS requires weight");
+        require_dtype(*weight, 0, 0, kFn, "weight");
+        require_len(*weight, K, kFn, "weight");
+        require_packed_contiguous(*weight, kFn, "weight");
+    }
+    int modulation_codes[2] = {0, 0};
+    const OptArray* modulation[2] = {&scale, &shift};
+    for (int i = 0; i < 2; ++i) {
+        if (!modulation[i]->has_value()) continue;
+        const int code = map_dtype_to_code((*modulation[i])->dtype());
+        if (code < 0 || code > 2)
+            throw std::runtime_error(std::string(kFn) + ": modulation must be floating point");
+        modulation_codes[i] = code;
+        require_len(**modulation[i], K, kFn, "modulation");
+        require_packed_contiguous(**modulation[i], kFn, "modulation");
+    }
+    launch_norm_convrot_quant_kernel(
+        x.data(), opt_data(weight), opt_data(scale), modulation_codes[0], opt_data(shift),
+        modulation_codes[1], q.data(), scales.data(), M, K, eps, norm_kind, tiled_output,
+        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -1356,19 +1558,6 @@ static void sage_check_shapes(const nb::ndarray<>& q, const nb::ndarray<>& k,
     }
 }
 
-// Kernels that synthesize strides from extents instead of reading tensor strides
-// require packed row-major operands, including views passed directly to _C.
-static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, const char* name) {
-    int64_t expected = 1;
-    for (int axis = static_cast<int>(t.ndim()) - 1; axis >= 0; --axis) {
-        if (t.shape(axis) != 1 && t.stride(axis) != expected) {
-            throw std::runtime_error(std::string(fn) + ": " + name +
-                                     " must be contiguous in the packed layout");
-        }
-        expected *= static_cast<int64_t>(t.shape(axis));
-    }
-}
-
 static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<>& q_scale,
                                  const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
                                  const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
@@ -1756,7 +1945,6 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
                 kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale, output_dtype_code,
                 reinterpret_cast<hipStream_t>(stream_ptr), kFn);
 }
-
 
 // BF16 decode attention. Every extent below is derived from the operands rather
 // than taken from the caller, and the kernel indexes with the strides passed
@@ -2296,6 +2484,8 @@ NB_MODULE(_C, m) {
     m.def("stochastic_round_fp8", &stochastic_round_fp8);
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
+    m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16);
+    m.def("int8_gemm_tiled128", &int8_gemm_tiled128);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
@@ -2309,7 +2499,10 @@ NB_MODULE(_C, m) {
     m.def("quantize_int8_convrot", &quantize_int8_convrot, nb::arg("x"), nb::arg("q"),
           nb::arg("scales"), nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),
           nb::arg("M"), nb::arg("K"), nb::arg("group_size"), nb::arg("act_code"),
-          nb::arg("stream_ptr"), nb::arg("act_weight") = nb::none(), nb::arg("act_eps") = 0.0f);
+          nb::arg("stream_ptr"), nb::arg("act_weight") = nb::none(), nb::arg("act_eps") = 0.0f,
+          nb::arg("tiled_output") = false, nb::arg("act_scale") = nb::none(),
+          nb::arg("act_shift") = nb::none(), nb::arg("act_up") = nb::none());
+    m.def("norm_convrot_quant", &norm_convrot_quant);
     m.def("quantize_int8_tensorwise", &quantize_int8_tensorwise);
     m.def("dequantize_int8_simple", &dequantize_int8_simple);
     m.def("dequantize_int8_convrot_weight", &dequantize_int8_convrot_weight);

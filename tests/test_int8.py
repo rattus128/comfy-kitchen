@@ -391,6 +391,31 @@ class TestTensorWiseINT8Layout:
         assert sd[""].dtype == torch.int8
         assert sd["_scale"].numel() == 1
 
+    @pytest.mark.parametrize(("n", "k"), [(128, 1024), (512, 1024), (11520, 3840)])
+    def test_linear_never_relayouts_weight_storage(self, seed, n, k):
+        """Dynamic VRAM owns the weight buffer: linear must read it in place."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
+
+        x = torch.randn(512, k, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True
+        )
+        row_major, scale = TensorWiseINT8Layout.get_plain_tensors(qt)
+        ptr = qt._qdata.data_ptr()
+        snapshot = qt._qdata.clone()
+
+        with torch.inference_mode():
+            reference = ck.int8_linear(
+                x, row_major.clone(), scale, out_dtype=x.dtype
+            )
+            candidate = torch.nn.functional.linear(x, qt)
+
+        assert torch.equal(candidate, reference)
+        assert qt._qdata.data_ptr() == ptr
+        assert torch.equal(qt._qdata, snapshot)
+
     def test_supports_fast_matmul(self):
         """supports_fast_matmul returns True on CUDA SM >= 7.5."""
         from comfy_kitchen.tensor import TensorWiseINT8Layout

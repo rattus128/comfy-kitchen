@@ -22,6 +22,8 @@ from comfy_kitchen.registry import registry
 from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
 
+from .conftest import skip_unless_gfx12_wmma
+
 
 def _unavailable_reason() -> str | None:
     """None when the backend is usable, else the registry's reason for withdrawing it.
@@ -176,6 +178,168 @@ def test_int8_linear_convrot_large_k_matches_eager(k):
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
 
 
+@pytest.mark.parametrize(("rows", "width"), [(160, 3840), (4096, 3840), (97, 3072), (5, 256), (13, 4100)])
+@pytest.mark.parametrize("batched", [False, True])
+def test_rms_gated_residual_is_exact(hip, rows, width, batched):
+    torch.manual_seed(8404 + rows + width)
+    activation = torch.randn(
+        (2, rows, width) if batched else (rows, width), device=DEV, dtype=torch.bfloat16)
+    residual = torch.randn_like(activation)
+    norm_weight = torch.randn(width, device=DEV, dtype=torch.bfloat16)
+    gate = torch.tanh(torch.randn(
+        width, device=DEV, dtype=torch.bfloat16))
+    eps = 1.0e-5
+    reference = residual + gate * torch.nn.functional.rms_norm(
+        activation, (width,), norm_weight, eps)
+
+    with ck.use_backend("hip"):
+        candidate = ck.rms_gated_residual(
+            activation, norm_weight, residual, gate, eps)
+
+    assert torch.equal(candidate, reference)
+
+
+@needs_wmma
+@pytest.mark.parametrize("n", [128, 256, 384])
+def test_int8_generic_tiled_a_is_exact(hip, n):
+    """Physical A tiling is a dimensional contract, not a model shape."""
+    torch.manual_seed(211)
+    m, k = 257, 1024
+    x = torch.randn((m, k), device=DEV, dtype=torch.bfloat16)
+    b = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    scale_b = torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
+    padded_m = (m + 127) // 128 * 128
+    padded_x = torch.nn.functional.pad(x, (0, 0, 0, padded_m - m))
+    row_a, padded_scale_a = hip._rotate_quant_int8(padded_x, 256)
+    tiled_scale_a = padded_scale_a[:m]
+    tiled_a = (
+        row_a.reshape(padded_m // 128, 128, k // 128, 128)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+    row_a = (
+        tiled_a.reshape(padded_m // 128, k // 128, 128, 128)
+        .permute(0, 2, 1, 3)
+        .reshape(padded_m, k)[:m]
+        .contiguous()
+    )
+
+    reference = torch.empty((m, n), device=DEV, dtype=torch.bfloat16)
+    row_major = torch.empty_like(reference)
+    stream = hip._stream(x)
+    hip._C.int8_gemm(
+        hip._dl(row_a), hip._dl(b), hip._dl(reference), hip._dl(tiled_scale_a),
+        hip._dl(scale_b), 1, None, m, n, k,
+        hip.DTYPE_TO_CODE[torch.bfloat16], stream,
+    )
+    hip._C.int8_gemm_tiled128(
+        hip._dl(tiled_a), hip._dl(b), hip._dl(row_major),
+        hip._dl(tiled_scale_a), hip._dl(scale_b), 1, None, m, n, k,
+        hip.DTYPE_TO_CODE[torch.bfloat16], stream,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(row_major, reference)
+
+
+@pytest.mark.parametrize("m", [127, 128, 129])
+@pytest.mark.parametrize("k", [3840, 10240])
+@pytest.mark.parametrize("act", [None, "gelu_tanh", "swiglu"])
+def test_convrot_direct_tiled_output_preserves_quantization(hip, m, k, act):
+    skip_unless_gfx12_wmma()
+    torch.manual_seed(218)
+    x = torch.randn(m, k * (2 if act == "swiglu" else 1), device=DEV, dtype=torch.bfloat16)
+    x[0].zero_()
+    x[1].mul_(0.001)
+    x[-1].mul_(17)
+    row_q, row_s = hip._rotate_quant_int8(x, 256, act)
+    tile_q, tile_s = hip._rotate_quant_int8(x, 256, act, tiled_output=True)
+    restored = tile_q.view(-1, k // 128, 128, 128).permute(0, 2, 1, 3).reshape(-1, k)[:m]
+    assert torch.equal(restored, row_q)
+    assert torch.equal(tile_s, row_s)
+
+
+@pytest.mark.parametrize("k", [4096, 6144, 12288, 16384])
+@pytest.mark.parametrize("act", [None, "swiglu"])
+def test_convrot_original_schedule_tiled_output_preserves_quantization(hip, k, act):
+    skip_unless_gfx12_wmma()
+    torch.manual_seed(221)
+    m = 129
+    x = torch.randn(m, k * (2 if act == "swiglu" else 1), device=DEV, dtype=torch.bfloat16)
+    x[0].zero_()
+    x[1].mul_(0.001)
+    x[-1].mul_(17)
+    row_q, row_s = hip._rotate_quant_int8(x, 256, act)
+    tile_q, tile_s = hip._rotate_quant_int8(x, 256, act, tiled_output=True)
+    restored = tile_q.view(-1, k // 128, 128, 128).permute(0, 2, 1, 3).reshape(-1, k)[:m]
+    assert torch.equal(restored, row_q)
+    assert torch.equal(tile_s, row_s)
+
+
+@pytest.mark.parametrize("m,n,k", [(511, 256, 3840), (512, 256, 3840), (513, 256, 10240), (513, 257, 3840)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_int8_linear_row_dispatch_and_epilogue(hip, monkeypatch, m, n, k, dtype):
+    skip_unless_gfx12_wmma()
+    torch.manual_seed(219)
+    x = torch.randn(m, 2 * k, device=DEV, dtype=torch.bfloat16)
+    w = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    # Scalar scaling exercises a different epilogue from channel scaling.
+    scale = torch.tensor([0.01], device=DEV)
+    bias = torch.randn(n, device=DEV, dtype=dtype)
+    q, s = hip._rotate_quant_int8(x, 256, "swiglu")
+    expected = torch.empty(m, n, device=DEV, dtype=dtype)
+    hip._C.int8_gemm(
+        hip._dl(q), hip._dl(w), hip._dl(expected), hip._dl(s), hip._dl(scale),
+        0, hip._dl(bias), m, n, k, hip.DTYPE_TO_CODE[dtype], hip._stream(x),
+    )
+    tiled_calls = []
+    original = hip._C.int8_gemm_tiled128
+
+    def counted(*args):
+        tiled_calls.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(hip._C, "int8_gemm_tiled128", counted)
+    actual = hip.int8_linear(x, w, scale, bias, dtype, convrot=True, input_act="swiglu")
+    assert not tiled_calls
+    assert torch.equal(actual, expected)
+
+
+@needs_wmma
+@pytest.mark.parametrize("n,k", [(1537, 2048), (3073, 1536)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_int8_rectangular_stages_preserve_dequant_order(hip, n, k, dtype):
+    torch.manual_seed(904 + n)
+    m = 513
+    a = torch.randint(-127, 128, (m, k), device=DEV, dtype=torch.int8)
+    b = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    sa = torch.rand(m, device=DEV) * 0.013 + 0.001
+    sb = torch.rand(n, device=DEV) * 0.021 + 0.002
+    out = torch.empty(m, n, device=DEV, dtype=dtype)
+    hip._C.int8_gemm(hip._dl(a), hip._dl(b), hip._dl(out), hip._dl(sa), hip._dl(sb),
+                     1, None, m, n, k, hip.DTYPE_TO_CODE[dtype], hip._stream(a))
+    rows = [0, 7, 127, 128, 256, 511, 512]
+    cols = [0, 17, 127, 255, 256, n - 2, n - 1]
+    # FP64 is exact for these integer dot products; round each dequant multiply
+    # separately, including samples on both sides of tile and matrix edges.
+    dot = (a[rows].double() @ b[cols].double().T).float()
+    expected = ((dot * sa[rows, None]) * sb[None, cols]).to(dtype)
+    assert torch.equal(out[rows][:, cols], expected)
+
+
+def test_convrot_tiled_binding_requires_padded_storage(hip):
+    skip_unless_gfx12_wmma()
+    m, k = 129, 3840
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    q = torch.empty(m, k, device=DEV, dtype=torch.int8)
+    scales = torch.empty(m, device=DEV)
+    with pytest.raises(RuntimeError, match="q"):
+        hip._C.quantize_int8_convrot(
+            hip._dl(x), hip._dl(q), hip._dl(scales), None, None,
+            m, k, 256, 0, hip._stream(x), None, 0.0, True,
+        )
+
+
 def _offset_copy(t: torch.Tensor) -> torch.Tensor:
     """A contiguous copy of ``t`` deliberately based off a 16-byte boundary."""
     flat = t.reshape(-1)
@@ -301,35 +465,212 @@ def test_int8_linear_swiglu_matches_the_eager_chain(tag, shape, kwargs):
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale, tag
 
 
-@needs_wmma
-def test_swiglu_quantizer_is_at_least_as_accurate_as_the_chain(hip):
-    """Fusing the gate into the rotation's load must not lose accuracy against
-    materializing silu(gate) * up in bf16 first."""
-    torch.manual_seed(0)
-    m, k, group = 512, 1024, 256
-    x = torch.randn(m, 2 * k, device=DEV, dtype=torch.bfloat16) * 2.0
-
-    xd = x.double()
-    activated = torch.nn.functional.silu(xd[:, :k]) * xd[:, k:]
-    mat = _build_hadamard(group, device=x.device, dtype=torch.float64)
-    rotated = (activated.reshape(-1, k // group, group) @ mat).reshape(-1, k)
-    scale = (rotated.abs().amax(-1, keepdim=True) / 127.0).clamp(min=1e-30)
-    exact = (rotated / scale).round().clamp(-128, 127)
-
-    chain_q, _ = hip._rotate_quant_int8(_swiglu(x).contiguous(), group)
-    fused_q, fused_s = hip._rotate_quant_int8(x, group, "swiglu")
-
-    err_chain = (chain_q.double() - exact).abs().mean().item()
-    err_fused = (fused_q.double() - exact).abs().mean().item()
-    assert err_fused <= max(err_chain * 1.05, 1e-4), (
-        f"fused ({err_fused:.6f}) less accurate than chain ({err_chain:.6f})"
-    )
-    assert fused_q.shape == (m, k)
-    assert fused_s.shape == (m,)
-
-
 def _rms_norm(x, w, eps=1e-5):
-    return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight=w.to(x.dtype), eps=eps)
+    return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight=w.float(), eps=eps).to(x.dtype)
+
+
+def _fp32_act_quant_reference(activated, storage_dtype):
+    # Independent dense rotation. HIP master rounds the rotated row, not the
+    # activation, to the input dtype before computing its scale and INT8 codes.
+    k = activated.shape[-1]
+    matrix = _build_hadamard(256, device=activated.device, dtype=torch.float64)
+    rotated = (activated.double().reshape(-1, k // 256, 256) @ matrix).reshape(-1, k)
+    rotated = rotated.to(storage_dtype).float()
+    maximum = rotated.abs().amax(-1).clamp(min=1e-10)
+    return (rotated * (127 / maximum[:, None])).round().clamp(-127, 127).to(torch.int8), maximum / 127
+
+
+def _assert_quant_close(q, scale, expected_q, expected_scale):
+    # Different FP32 reduction/butterfly orders can cross rare quantization
+    # boundaries. A BF16 activation store instead changes many INT8 codes.
+    error = (q.int() - expected_q.int()).abs()
+    assert error.max().item() <= 1
+    assert error.float().mean().item() < 1e-3
+    torch.testing.assert_close(scale, expected_scale, rtol=1e-6, atol=0)
+
+
+@pytest.mark.parametrize("k", [3840, 4096, 10240, 12288, 16384, 32768])
+def test_bf16_swiglu_quantizer_keeps_fp32_intermediates(hip, k):
+    torch.manual_seed(17)
+    x = torch.randn(129, 2 * k, device=DEV, dtype=torch.bfloat16) * 5
+    gate, up = x.chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate.float()) * up.float()
+    ref_q, ref_s = _fp32_act_quant_reference(activated, x.dtype)
+    rounded_q, _ = hip._rotate_quant_int8(_swiglu(x), 256)
+    assert (rounded_q != ref_q).float().mean().item() > 0.01
+    for tiled in (False, True):
+        q, s = hip._rotate_quant_int8(x, 256, "swiglu", tiled_output=tiled)
+        if tiled:
+            q = q.view(-1, k // 128, 128, 128).permute(0, 2, 1, 3).reshape(-1, k)[:129]
+        _assert_quant_close(q, s, ref_q, ref_s)
+
+
+@pytest.mark.parametrize("k", [4096, 6144])
+@pytest.mark.parametrize("modulation", ["none", "scale", "shift", "both"])
+def test_rms_norm_convrot_quant_keeps_fp32_intermediates(hip, k, modulation):
+    torch.manual_seed(230)
+    x = torch.randn(5, k, device=DEV, dtype=torch.bfloat16)
+    x[:, ::3] *= 0.017
+    weight = torch.randn(k, device=DEV, dtype=torch.float32) + 0.250123
+    scale = torch.randn(k, device=DEV, dtype=torch.bfloat16) * 0.3 if modulation in ("scale", "both") else None
+    shift = torch.randn(k, device=DEV, dtype=torch.bfloat16) * 0.2 if modulation in ("shift", "both") else None
+    expected = torch.nn.functional.rms_norm(x.float(), (k,), weight, 3e-4)
+    if scale is not None:
+        expected = expected * (1 + scale.float())
+    if shift is not None:
+        expected = expected + shift.float()
+    ref_q, ref_s = _fp32_act_quant_reference(expected, x.dtype)
+    q, s = hip._norm_convrot_quant_int8(x, weight, scale, shift, 3e-4, 0)
+    _assert_quant_close(q, s, ref_q, ref_s)
+
+
+@pytest.mark.parametrize("k", [4096, 6144])
+@pytest.mark.parametrize("modulation", ["none", "scale", "shift", "both"])
+def test_adaln_convrot_quant_exact(hip, k, modulation):
+    torch.manual_seed(231)
+    x = torch.randn(5, k, device=DEV, dtype=torch.bfloat16)
+    x[:, ::2] += 1.75
+    scale = torch.randn(k, device=DEV, dtype=torch.float32) * 0.3 if modulation in ("scale", "both") else None
+    shift = torch.randn(k, device=DEV, dtype=torch.float32) * 0.2 if modulation in ("shift", "both") else None
+    zero = torch.zeros(k, device=DEV)
+    expected = ck.adaln(x, zero if scale is None else scale,
+                        zero if shift is None else shift, 3e-4)
+    ref_q, ref_s = hip._rotate_quant_int8(expected.contiguous(), 256)
+    q, s = hip._norm_convrot_quant_int8(x, None, scale, shift, 3e-4, 1)
+    assert torch.equal(q, ref_q)
+    assert torch.equal(s, ref_s)
+
+
+@pytest.mark.parametrize("k", [256, 3840, 4096, 6144, 10240, 16384])
+@pytest.mark.parametrize("act", ["rms_norm", "adaln"])
+def test_norm_linear_native_dispatch_and_fallback_preserve_outputs(hip, monkeypatch, k, act):
+    torch.manual_seed(230 if act == "rms_norm" else 231)
+    x = torch.randn(5, k, device=DEV, dtype=torch.bfloat16)
+    gamma = torch.randn(k, device=DEV) + 0.25
+    scale = torch.randn(k, device=DEV, dtype=torch.bfloat16) * 0.3
+    shift = torch.randn_like(scale) * 0.2
+    if act == "rms_norm":
+        x[:, ::3] *= 0.017
+        normalized = torch.nn.functional.rms_norm(x.float(), (k,), gamma, 3e-4).bfloat16()
+        normalized = normalized * (1 + scale) + shift
+    else:
+        x[:, ::2] += 1.75
+        normalized = ck.adaln(x, scale, shift, 3e-4)
+    weight = torch.randint(-127, 128, (128, k), device=DEV, dtype=torch.int8)
+    weight_scale = torch.rand(128, device=DEV) * 0.01
+    expected = hip.int8_linear(normalized, weight, weight_scale, convrot=True)
+    calls = []
+    native = hip._norm_convrot_quant_int8
+
+    def counted(*args, **kwargs):
+        calls.append(True)
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(hip, "_norm_convrot_quant_int8", counted)
+    actual = hip.int8_linear(
+        x, weight, weight_scale, convrot=True, input_act=act,
+        input_act_weight=gamma if act == "rms_norm" else None, input_act_eps=3e-4,
+        input_act_scale=scale, input_act_shift=shift)
+    assert bool(calls) == (k in (4096, 6144) and hip._has_nonduplicated_wmma(x.device))
+    if act == "rms_norm" and k in (3840, 4096, 6144, 10240):
+        assert (actual.float() - expected.float()).abs().max() < 0.03 * expected.float().abs().max()
+    else:
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("act", ["rms_norm", "adaln", "swiglu"])
+def test_convrot_fallback_preserves_activation_operands(hip, monkeypatch, act):
+    torch.manual_seed(235)
+    k = 4096
+    x = torch.randn(3, 2 * k if act == "swiglu" else k, device=DEV, dtype=torch.bfloat16)
+    weight = torch.randint(-127, 128, (32, k), device=DEV, dtype=torch.int8)
+    weight_scale = torch.rand(32, device=DEV) * 0.01
+    kwargs = {"input_act": act}
+    if act == "swiglu":
+        gate, up = x.chunk(2, dim=-1)
+        activated = torch.nn.functional.silu(gate) * up
+    else:
+        scale = torch.randn(k, device=DEV, dtype=torch.bfloat16) * 0.3
+        shift = torch.randn_like(scale) * 0.2
+        kwargs.update(input_act_scale=scale, input_act_shift=shift, input_act_eps=3e-4)
+        if act == "rms_norm":
+            gamma = torch.randn(k, device=DEV) + 0.25
+            activated = torch.nn.functional.rms_norm(x.float(), (k,), gamma, 3e-4).bfloat16()
+            activated = activated * (1 + scale) + shift
+            kwargs.update(input_act_weight=gamma)
+        else:
+            activated = ck.adaln(x, scale, shift, 3e-4)
+    expected = hip._eager.int8_linear(activated, weight, weight_scale, convrot=True)
+    monkeypatch.setattr(hip, "_convrot_supported", lambda *args, **kwargs: False)
+    actual = hip.int8_linear(x, weight, weight_scale, convrot=True, **kwargs)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("m", [1, 129, 513])
+@pytest.mark.parametrize("k", [3840, 10240])
+@pytest.mark.parametrize("modulation", ["none", "scale", "shift", "both"])
+def test_packed_rms_prologue_keeps_fp32_intermediates_and_weight(hip, m, k, modulation):
+    skip_unless_gfx12_wmma()
+    torch.manual_seed(220)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16) * 1.7
+    x[0, ::3] *= 0.013
+    # Deliberately not BF16-representable: the native path must not truncate it.
+    nw = torch.randn(k, device=DEV, dtype=torch.float32) + 0.300123
+    scale = torch.randn(k, device=DEV, dtype=torch.bfloat16) * 0.4 if modulation in ("scale", "both") else None
+    shift = torch.randn(k, device=DEV, dtype=torch.bfloat16) * 0.3 if modulation in ("shift", "both") else None
+    normalized = torch.nn.functional.rms_norm(x.float(), (k,), nw, 3e-4)
+    if scale is not None:
+        normalized = normalized * (1 + scale.float())
+    if shift is not None:
+        normalized = normalized + shift.float()
+    ref_q, ref_s = _fp32_act_quant_reference(normalized, x.dtype)
+    for tiled in (False, True):
+        q, s = hip._rotate_quant_int8(
+            x, 256, "rms_norm", nw, 3e-4, tiled_output=tiled, act_scale=scale, act_shift=shift)
+        if tiled:
+            q = q.view(-1, k // 128, 128, 128).permute(0, 2, 1, 3).reshape(-1, k)[:m]
+        _assert_quant_close(q, s, ref_q, ref_s)
+
+
+@pytest.mark.parametrize("case", ["plain", "modulated", "batched", "fp32_scale", "other_k", "short_k", "no_rotation"])
+def test_int8_rms_modulation_dispatch(hip, monkeypatch, case):
+    skip_unless_gfx12_wmma()
+    torch.manual_seed(221)
+    k = {"other_k": 1024, "short_k": 768}.get(case, 3840)
+    x = torch.randn(2 if case == "batched" else 1, 513, k, device=DEV, dtype=torch.bfloat16)
+    nw = torch.randn(k, device=DEV, dtype=torch.bfloat16)
+    scale = torch.randn(x.shape[0], 1, k, device=DEV, dtype=(
+        torch.float32 if case == "fp32_scale" else torch.bfloat16)) * 0.3
+    if case == "plain":
+        scale = None
+    weight = torch.randint(-127, 128, (256, k), dtype=torch.int8, device=DEV)
+    ws = torch.rand(256, device=DEV) * 0.01
+    normalized = _rms_norm(x, nw, 3e-4)
+    if scale is not None:
+        normalized = normalized * (1 + scale)
+    convrot = case != "no_rotation"
+    ref = hip.int8_linear(normalized, weight, ws, convrot=convrot)
+    calls = []
+    original = hip._rotate_quant_int8
+
+    def quantize(*args, **kwargs):
+        calls.append((args[2], kwargs.get("tiled_output", False), kwargs.get("act_scale") is not None))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hip, "_rotate_quant_int8", quantize)
+    with ck.use_backend("hip"):
+        got = ck.int8_linear(x, weight, ws, convrot=convrot, input_act="rms_norm",
+                             input_act_weight=nw, input_act_eps=3e-4, input_act_scale=scale)
+    if case in ("plain", "modulated"):
+        assert (got.float() - ref.float()).abs().max() < 0.03 * ref.float().abs().max()
+    else:
+        assert torch.equal(got, ref)
+    if convrot:
+        fused = case in ("plain", "modulated")
+        assert calls == [("rms_norm" if fused else None,
+                          False, case == "modulated")]
+    else:
+        assert not calls
 
 
 # rms_norm is folded only into the fused G=256 kernel; the spill and G=64 routes
@@ -391,6 +732,18 @@ def test_rms_norm_quantizer_is_at_least_as_accurate_as_the_chain(hip, dtype, m, 
         f"fused ({err_fused:.6f}) less accurate than chain ({err_chain:.6f})"
     )
     assert fused_s.shape == (m,)
+
+
+@needs_wmma
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_generic_rms_quantizer_preserves_fp32_weight(hip, dtype):
+    torch.manual_seed(55)
+    x = torch.randn(17, 1024, device=DEV, dtype=dtype)
+    weight = torch.randn(1024, device=DEV, dtype=torch.float32) + 0.300123
+    normalized = torch.nn.functional.rms_norm(x.float(), (1024,), weight, 1e-5)
+    expected, expected_scale = _fp32_act_quant_reference(normalized, dtype)
+    actual, scale = hip._rotate_quant_int8(x, 256, "rms_norm", weight, 1e-5)
+    _assert_quant_close(actual, scale, expected, expected_scale)
 
 
 @needs_wmma
@@ -2996,15 +3349,15 @@ def test_convrot_falls_back_to_eager_past_the_lds_bound(hip, dtype):
         )
 
 
-def test_convrot_spill_rotated_dtype_must_match_x(hip):
-    """spill_rotated is written as RowT derived from x; dtype must match."""
+def test_convrot_spill_rotated_must_match_input_dtype(hip):
+    """The two-pass path preserves the fused row-buffer rounding contract."""
     m, k = 2, 256
-    x = torch.randn(m, k, device=DEV, dtype=torch.float32)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
     q = torch.zeros(m, k, dtype=torch.int8, device=DEV)
     scales = torch.zeros(m, dtype=torch.float32, device=DEV)
-    spill_rotated = torch.empty(m, k, dtype=torch.bfloat16, device=DEV)
+    spill_rotated = torch.empty(m, k, dtype=torch.float32, device=DEV)
     spill_partials = torch.empty(m, k // 256, dtype=torch.float32, device=DEV)
-    with pytest.raises(RuntimeError, match="spill_rotated dtype must match x"):
+    with pytest.raises(RuntimeError, match="spill_rotated"):
         hip._C.quantize_int8_convrot(
             hip._dl(x),
             hip._dl(q),
@@ -3025,6 +3378,100 @@ def test_convrot_int8_needs_spill_probe(hip):
     with torch.cuda.device(DEV):
         assert not hip._C.convrot_int8_needs_spill(4128, 10240, in_code)
         assert hip._C.convrot_int8_needs_spill(4128, 32768, in_code)
+
+
+@needs_wmma
+def test_convrot_wide_global_is_exact_to_fused_lds(hip):
+    """The global-spill implementation matches the fused-LDS one row for row."""
+    torch.manual_seed(37)
+    m, k = 96, 28672
+    in_code = hip.DTYPE_TO_CODE[torch.bfloat16]
+    with torch.cuda.device(DEV):
+        # 96 rows of this width take the global path; 64 fit the one-wave
+        # fused-LDS schedule.
+        assert hip._C.convrot_int8_needs_spill(m, k, in_code)
+        assert not hip._C.convrot_int8_needs_spill(64, k, in_code)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    global_q = torch.empty(m, k, device=DEV, dtype=torch.int8)
+    global_scales = torch.empty(m, device=DEV, dtype=torch.float32)
+    fused_q = torch.empty_like(global_q)
+    fused_scales = torch.empty_like(global_scales)
+    spill_rotated = torch.empty(m, k, device=DEV, dtype=x.dtype)
+    spill_partials = torch.empty(m, k // 256, device=DEV, dtype=torch.float32)
+
+    hip._C.quantize_int8_convrot(
+        hip._dl(x), hip._dl(global_q), hip._dl(global_scales),
+        hip._dl(spill_rotated), hip._dl(spill_partials), m, k, 256, 0,
+        hip._stream(x),
+    )
+    # ConvRot is row-independent, so two launches below 96 rows, which take
+    # the fused-LDS schedule, form a reference for the same 96 rows.
+    for start, end in ((0, 64), (64, m)):
+        hip._C.quantize_int8_convrot(
+            hip._dl(x[start:end]), hip._dl(fused_q[start:end]),
+            hip._dl(fused_scales[start:end]), hip._dl(spill_rotated),
+            hip._dl(spill_partials), end - start, k, 256, 0,
+            hip._stream(x),
+        )
+    torch.cuda.synchronize()
+
+    assert torch.equal(global_q, fused_q)
+    assert torch.equal(global_scales, fused_scales)
+
+
+@needs_wmma
+@pytest.mark.parametrize("tiled", [False, True])
+def test_convrot_wide_spill_chunks_are_exact(hip, monkeypatch, tiled):
+    """Bounded row chunks write into the caller's q and scales in place."""
+    torch.manual_seed(41)
+    m, k = 257, 32768
+    in_code = hip.DTYPE_TO_CODE[torch.bfloat16]
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    with torch.cuda.device(x.device):
+        assert hip._C.convrot_int8_needs_spill(m, k, in_code)
+    expected_q = torch.empty(m, k, device=DEV, dtype=torch.int8)
+    expected_scales = torch.empty(m, device=DEV, dtype=torch.float32)
+    spill_rotated = torch.empty(m, k, device=DEV, dtype=x.dtype)
+    spill_partials = torch.empty(m, k // 256, device=DEV, dtype=torch.float32)
+
+    hip._C.quantize_int8_convrot(
+        hip._dl(x), hip._dl(expected_q), hip._dl(expected_scales),
+        hip._dl(spill_rotated), hip._dl(spill_partials), m, k, 256, 1,
+        hip._stream(x),
+    )
+    # 190 rows fit this cap, so the call runs two chunks of 129 and 128 rows;
+    # the second chunk's scales slice starts at a 4-byte (not 16-byte) offset.
+    # Tile-major output instead runs 128, 128, 1 with a padded final tile.
+    monkeypatch.setattr(hip, "_CONVROT_SPILL_WORKSPACE_BYTES", 12 << 20)
+    actual_q, actual_scales = hip._rotate_quant_int8(x, 256, "gelu_tanh", tiled_output=tiled)
+    if tiled:
+        actual_q = actual_q.view(-1, k // 128, 128, 128).permute(0, 2, 1, 3).reshape(-1, k)[:m]
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual_q, expected_q)
+    assert torch.equal(actual_scales, expected_scales)
+
+
+def test_convrot_spill_rebalancing_preserves_workspace_cap(hip, monkeypatch):
+    """A 96-row rebalance cannot merge two capacity-safe chunks into one."""
+    m, k = 96, 256
+    x = torch.empty(m, k, device=DEV, dtype=torch.bfloat16)
+    workspace_per_row = x.element_size() * k + 4 * (k // 256)
+    workspace_bytes = 95 * workspace_per_row
+    launched_rows = []
+
+    monkeypatch.setattr(hip, "_CONVROT_SPILL_WORKSPACE_BYTES", workspace_bytes)
+    monkeypatch.setattr(hip._C, "convrot_int8_needs_spill", lambda *_: True)
+    monkeypatch.setattr(
+        hip._C,
+        "quantize_int8_convrot",
+        lambda *args: launched_rows.append(args[5]),
+    )
+
+    hip._rotate_quant_int8(x, 256)
+
+    assert sum(launched_rows) == m
+    assert max(launched_rows) * workspace_per_row <= workspace_bytes
 
 
 def test_convrot_lds_bound_accounts_for_row_dtype(hip):

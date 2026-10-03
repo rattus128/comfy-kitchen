@@ -476,6 +476,9 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    input_act_scale: torch.Tensor | None = None,
+    input_act_shift: torch.Tensor | None = None,
+    input_act_up: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run dynamically quantized INT8 linear on Ascend NPU.
 
@@ -484,7 +487,8 @@ def int8_linear(
     a full weight copy on every forward pass.
     """
     orig_shape = x.shape
-    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps,
+                         input_act_scale, input_act_shift, input_act_up)
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError(
             "Input and weight inner dimensions must match, "

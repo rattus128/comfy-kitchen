@@ -155,6 +155,8 @@ set(HIP_SOURCES
     ops/per_tensor_fp8.hip
     ops/stochastic_round_fp8.hip
     ops/quantize_int8.hip
+    ops/norm_convrot_quant.hip
+    ops/rms_gated_residual.hip
     ops/gemm_fp8.hip
     ops/gemm_int8.hip
     ops/gemm_fp16.hip

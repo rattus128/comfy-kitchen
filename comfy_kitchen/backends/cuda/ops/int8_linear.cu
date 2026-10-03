@@ -1184,17 +1184,15 @@ __device__ __forceinline__ float apply_input_act(float v) {
     return v;
 }
 
-// Reads one activated value: column `col` of the K-wide activated row starting
-// at `in_row`. For SwiGLU the raw row is 2*K wide with the gate in the first
-// half; every other activation reads the same K-wide row it writes.
+// The host resolves packed SwiGLU input into gate/up pointers and row strides.
 template<int ACT, typename InputType>
 __device__ __forceinline__ float load_input_act(
-    const InputType* __restrict__ x, int64_t in_row, int col, int K)
+    const InputType* __restrict__ x, const InputType* __restrict__ act_up,
+    int64_t in_row, int64_t up_row, int col)
 {
     if constexpr (ACT == kActSwiGLU) {
-        // Matches torch silu(gate) * up.
         const float gate = to_float(x[in_row + col]);
-        const float up = to_float(x[in_row + K + col]);
+        const float up = to_float(act_up[up_row + col]);
         return (gate / (1.0f + expf(-gate))) * up;
     } else {
         return apply_input_act<ACT>(to_float(x[in_row + col]));
@@ -1204,11 +1202,17 @@ __device__ __forceinline__ float load_input_act(
 template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC, int ACT = kActNone>
 __global__ void quantize_int8_rowwise_convrot64_kernel(
     const InputType* __restrict__ x,
+    const InputType* __restrict__ act_up,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
     int K,
+    int64_t input_row_stride,
+    int64_t up_row_stride,
     uint64_t seed,
-    const InputType* __restrict__ act_weight,
+    const void* __restrict__ act_weight,
+    const InputType* __restrict__ act_scale,
+    const InputType* __restrict__ act_shift,
+    int act_weight_dtype_code,
     float act_eps)
 {
     constexpr int kGroupThreads = 64;
@@ -1227,9 +1231,8 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     const int sub = tid / kGroupThreads;
     const int lane = tid % kGroupThreads;
     const int64_t row_offset = static_cast<int64_t>(row) * K;
-    // SwiGLU reads a [gate | up] raw row twice as wide as the K it writes.
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
-    const int64_t in_row_offset = row_offset * kInWidth;
+    const int64_t in_row_offset = static_cast<int64_t>(row) * input_row_stride;
+    const int64_t up_row_offset = static_cast<int64_t>(row) * up_row_stride;
     const int n_groups = K / kConvRotGroup;
 
     float* buf0 = tmp + sub * (2 * kConvRotGroup);
@@ -1243,7 +1246,7 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     if constexpr (ACT == kActRmsNorm) {
         float sum_sq = 0.0f;
         for (int col = tid; col < K; col += BLOCK_THREADS) {
-            const float v = to_float(x[row_offset + col]);
+            const float v = to_float(x[in_row_offset + col]);
             row_buf[col] = v;
             sum_sq += v * v;
         }
@@ -1261,15 +1264,31 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
 
         float x0, x1, x2, x3;
         if constexpr (ACT == kActRmsNorm) {
-            x0 = active ? row_buf[col] * rstd * to_float(act_weight[col]) : 0.0f;
-            x1 = active ? row_buf[col + 1] * rstd * to_float(act_weight[col + 1]) : 0.0f;
-            x2 = active ? row_buf[col + 2] * rstd * to_float(act_weight[col + 2]) : 0.0f;
-            x3 = active ? row_buf[col + 3] * rstd * to_float(act_weight[col + 3]) : 0.0f;
+            auto rms_modulate = [&](int c) {
+                float weight;
+                switch (act_weight_dtype_code) {
+                    case 0: weight = static_cast<const float*>(act_weight)[c]; break;
+                    case 1: weight = to_float(static_cast<const half*>(act_weight)[c]); break;
+                    default: weight = to_float(static_cast<const nv_bfloat16*>(act_weight)[c]); break;
+                }
+                float value = row_buf[c] * rstd * weight;
+                if (act_scale != nullptr) {
+                    value *= 1.0f + to_float(act_scale[c]);
+                }
+                if (act_shift != nullptr) {
+                    value += to_float(act_shift[c]);
+                }
+                return value;
+            };
+            x0 = active ? rms_modulate(col) : 0.0f;
+            x1 = active ? rms_modulate(col + 1) : 0.0f;
+            x2 = active ? rms_modulate(col + 2) : 0.0f;
+            x3 = active ? rms_modulate(col + 3) : 0.0f;
         } else {
-            x0 = active ? load_input_act<ACT>(x, in_row_offset, col, K) : 0.0f;
-            x1 = active ? load_input_act<ACT>(x, in_row_offset, col + 1, K) : 0.0f;
-            x2 = active ? load_input_act<ACT>(x, in_row_offset, col + 2, K) : 0.0f;
-            x3 = active ? load_input_act<ACT>(x, in_row_offset, col + 3, K) : 0.0f;
+            x0 = active ? load_input_act<ACT>(x, act_up, in_row_offset, up_row_offset, col) : 0.0f;
+            x1 = active ? load_input_act<ACT>(x, act_up, in_row_offset, up_row_offset, col + 1) : 0.0f;
+            x2 = active ? load_input_act<ACT>(x, act_up, in_row_offset, up_row_offset, col + 2) : 0.0f;
+            x3 = active ? load_input_act<ACT>(x, act_up, in_row_offset, up_row_offset, col + 3) : 0.0f;
         }
         buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
         buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
@@ -1608,16 +1627,22 @@ void launch_quantize_int8_convrot_staged_kernel(
 
 void launch_quantize_int8_rowwise_convrot64_kernel(
     const void* input,
+    const void* act_up,
     void* output,
     void* scales,
     int64_t num_rows,
     int64_t num_cols,
+    int64_t input_row_stride,
+    int64_t up_row_stride,
     int group_size,
     int input_dtype_code,
     bool stochastic,
     int act_code,
     uint64_t seed,
     const void* act_weight,
+    const void* act_scale,
+    const void* act_shift,
+    int act_weight_dtype_code,
     float act_eps,
     cudaStream_t stream)
 {
@@ -1657,11 +1682,17 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
             }
             kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
                 static_cast<const InputType*>(input),
+                static_cast<const InputType*>(act_up),
                 static_cast<int8_t*>(output),
                 static_cast<float*>(scales),
                 static_cast<int>(num_cols),
+                input_row_stride,
+                up_row_stride,
                 seed,
-                static_cast<const InputType*>(act_weight),
+                act_weight,
+                static_cast<const InputType*>(act_scale),
+                static_cast<const InputType*>(act_shift),
+                act_weight_dtype_code,
                 act_eps);
         };
 

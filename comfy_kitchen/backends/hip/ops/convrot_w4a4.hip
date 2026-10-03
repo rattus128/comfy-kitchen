@@ -101,7 +101,7 @@ extern "C" void launch_convrot_quant_int4_kernel(
         return;  // a zero-block launch is hipErrorInvalidConfiguration
     }
     launch_convrot_quant<true>(
-        x, in_code, static_cast<int8_t*>(qout), static_cast<float*>(scales),
+        ConvrotInput{x, nullptr, K, 0}, in_code, static_cast<int8_t*>(qout), static_cast<float*>(scales),
         M, K, group_size, stream);
 }
 

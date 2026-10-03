@@ -381,3 +381,158 @@ class TestRmsNormInputAct:
                 h, weight, wscale, None, torch.bfloat16,
                 convrot=True, convrot_groupsize=_GROUP, input_act="rms_norm",
             )
+
+
+@pytest.mark.parametrize("backend", ["eager", "hip", "cuda", "triton"])
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_rms_modulation_broadcast_and_rounding(backend, cuda_available, with_scale):
+    device = "cpu" if backend == "eager" else "cuda"
+    if device == "cuda" and not cuda_available:
+        pytest.skip("GPU required")
+    if backend not in get_capable_backends("int8_linear", device):
+        pytest.skip(f"backend '{backend}' not capable")
+    torch.manual_seed(224)
+    x = torch.randn(2, 17, 256, device=device, dtype=torch.bfloat16)
+    gamma = torch.randn(256, device=device, dtype=torch.bfloat16) + 0.25
+    scale = torch.randn(2, 1, 512, device=device, dtype=torch.bfloat16)[..., ::2] * 0.3
+    shift = torch.randn(2, 1, 512, device=device, dtype=torch.bfloat16)[..., ::2] * 0.2
+    weight = torch.randint(-127, 128, (128, 256), device=device, dtype=torch.int8)
+    ws = torch.rand(128, device=device) * 0.01
+    normalized = functional.rms_norm(x, (256,), gamma, 3e-4)
+    if with_scale:
+        normalized = normalized * (1 + scale)
+    else:
+        scale = None
+    modulated = normalized + shift
+    with ck.use_backend(backend):
+        expected = ck.int8_linear(modulated, weight, ws)
+        actual = ck.int8_linear(x, weight, ws, input_act="rms_norm",
+                                input_act_weight=gamma, input_act_eps=3e-4,
+                                input_act_scale=scale, input_act_shift=shift)
+        assert torch.equal(actual, expected)
+        with pytest.raises(ValueError, match=r"requires.*rms_norm"):
+            ck.int8_linear(x, weight, ws, input_act_shift=shift)
+
+
+def test_swiglu_rounds_before_multiply():
+    from comfy_kitchen.backends._activations import apply_input_act
+
+    torch.manual_seed(31)
+    x = torch.randn(5, 32, dtype=torch.bfloat16)
+    gate, up = x.chunk(2, dim=-1)
+    expected = functional.silu(gate) * up
+    actual = apply_input_act(x, "swiglu")
+    wrong = (functional.silu(gate.float()) * up.float()).to(x.dtype)
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, wrong)
+
+
+def test_rms_norm_preserves_fp32_weight():
+    from comfy_kitchen.backends._activations import apply_input_act
+
+    torch.manual_seed(32)
+    x = torch.randn(4, 32, dtype=torch.bfloat16)
+    weight = torch.randn(32, dtype=torch.float32)
+    actual = apply_input_act(x, "rms_norm", weight, 1e-5)
+    expected = functional.rms_norm(x.float(), (32,), weight, 1e-5).to(torch.bfloat16)
+    truncated = functional.rms_norm(x.float(), (32,), weight.bfloat16().float(), 1e-5).to(torch.bfloat16)
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, truncated)
+
+
+def test_adaln_shift_only():
+    from comfy_kitchen.backends._activations import apply_input_act
+
+    torch.manual_seed(33)
+    x = torch.randn(3, 32, dtype=torch.bfloat16)
+    shift = torch.randn(32, dtype=torch.bfloat16)
+    actual = apply_input_act(x, "adaln", act_eps=1e-5, act_shift=shift)
+    expected = ck.adaln(x, torch.zeros_like(shift), shift, 1e-5)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("backend", ["eager", "hip", "cuda", "triton"])
+@pytest.mark.parametrize("layout", ["views", "independent", "strided", "transposed_batch"])
+@pytest.mark.parametrize("convrot", [False, True])
+def test_two_input_swiglu_linear(backend, layout, convrot, cuda_available, monkeypatch):
+    device = "cpu" if backend == "eager" else "cuda"
+    if device == "cuda" and not cuda_available:
+        pytest.skip("GPU required")
+    if backend not in get_capable_backends("int8_linear", device):
+        pytest.skip(f"backend '{backend}' not capable")
+    torch.manual_seed(83)
+    packed = torch.randn(2, 17, 512, dtype=torch.bfloat16, device=device)
+    gate, up = packed.chunk(2, -1)
+    if layout == "independent":
+        gate, up = gate.contiguous(), up.contiguous()
+    elif layout == "strided":
+        gate, up = packed[..., ::2], packed[..., 1::2]
+    elif layout == "transposed_batch":
+        gate, up = gate.transpose(0, 1), up.transpose(0, 1)
+    weight = torch.randint(-80, 81, (128, 256), dtype=torch.int8, device=device)
+    scale = torch.rand(128, device=device) * 0.01
+    kwargs = {"convrot": convrot, "input_act": "swiglu"}
+    with ck.use_backend(backend):
+        expected = ck.int8_linear(torch.cat((gate, up), -1), weight, scale, **kwargs)
+        if backend == "hip" and convrot and layout == "views":
+            from comfy_kitchen.backends import hip
+
+            quantize = hip._rotate_quant_int8
+
+            def check_views(x, *args, **kwargs):
+                assert x.data_ptr() == gate.data_ptr()
+                assert kwargs["act_up"].data_ptr() == up.data_ptr()
+                return quantize(x, *args, **kwargs)
+
+            monkeypatch.setattr(hip, "_rotate_quant_int8", check_views)
+        actual = ck.int8_linear(gate, weight, scale, input_act_up=up, **kwargs)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("m,k,group", [
+    (7, 64, 16), (9, 256, 64), (37, 2048, 256),
+    (512, 10240, 256), (128, 32768, 256),
+    (512, 12288, 256), (512, 16384, 256),
+])
+@pytest.mark.parametrize("independent", [False, True])
+def test_hip_two_input_swiglu_quantizer(m, k, group, independent, monkeypatch, cuda_available):
+    if not cuda_available or "hip" not in get_capable_backends("int8_linear", "cuda"):
+        pytest.skip("HIP backend required")
+    from comfy_kitchen.backends import hip
+
+    torch.manual_seed(84)
+    packed = torch.randn(m, 2 * k, device="cuda", dtype=torch.bfloat16)
+    gate, up = packed.chunk(2, -1)
+    if independent:
+        # Different positive row strides and storage offsets catch a kernel
+        # that still assumes up = gate + K or uses the gate's stride for both.
+        storage = torch.empty(m, k + 8, device="cuda", dtype=packed.dtype)
+        storage[:, 4:4+k].copy_(up)
+        up = storage[:, 4:4+k]
+    expected = hip._rotate_quant_int8(packed, group, "swiglu")
+    native = hip._C.quantize_int8_convrot
+    seen = []
+
+    def capture(*args):
+        # DLPack must receive the original two allocations, not copies.
+        gate_arg, up_arg = torch.from_dlpack(args[0]), torch.from_dlpack(args[-1])
+        seen.append((gate_arg.data_ptr(), up_arg.data_ptr()))
+        return native(hip._dl(gate_arg), *args[1:-1], hip._dl(up_arg))
+
+    monkeypatch.setattr(hip._C, "quantize_int8_convrot", capture)
+    actual = hip._rotate_quant_int8(gate, group, "swiglu", act_up=up)
+    assert seen[0] == (gate.data_ptr(), up.data_ptr())
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=False))
+
+
+def test_two_input_swiglu_precision_and_validation():
+    from comfy_kitchen.backends._activations import apply_input_act
+
+    gate = torch.tensor([[-2.13, 0.77, 1.29, 4.51]], dtype=torch.float32)
+    up = torch.tensor([[3.17, -1.37, 0.17, 2.51]], dtype=torch.float32)
+    expected = functional.silu(gate) * up
+    actual = apply_input_act(gate, "swiglu", act_up=up)
+    assert torch.equal(actual, expected)
+    for act, bad_up in [(None, up), ("swiglu", up[:, :2]), ("swiglu", up.bfloat16())]:
+        with pytest.raises(ValueError, match="input_act_up"):
+            apply_input_act(gate, act, act_up=bad_up)

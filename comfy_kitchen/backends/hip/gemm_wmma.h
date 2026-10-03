@@ -19,6 +19,8 @@
 #pragma once
 
 #include <atomic>
+#include <cstring>
+#include <type_traits>
 
 #include "mma.h"
 
@@ -35,7 +37,7 @@ constexpr int kLdsPad = 8;
 // kbytes is the source row length in bytes (K for 8-bit types, K/2 for int4) and
 // is a multiple of 16, so a 16-byte chunk starting inside a row also ends inside
 // it. Out-of-range rows and the K tail are zero-filled.
-template <int ROWS, int BKB, int THREADS>
+template <int ROWS, int BKB, int THREADS, bool COALESCED_STAGING = false>
 struct TileStager {
     static constexpr int kChunksPerRow = BKB / 16;
     static constexpr int kChunks = ROWS * kChunksPerRow;
@@ -51,9 +53,29 @@ struct TileStager {
     __forceinline__ __device__ void load(const uint8_t* __restrict__ src, int row0, int rows_total,
                                          int kbyte0, int kbytes) {
         const int tid = threadIdx.x;
+        const bool full_tile =
+            row0 + ROWS <= rows_total && kbyte0 + BKB <= kbytes;
+
+        if (full_tile) {
+            #pragma unroll
+            for (int i = 0; i < kPerThread; ++i) {
+                const int c = COALESCED_STAGING ? tid + i * THREADS
+                                                 : tid * kPerThread + i;
+                const int grow = row0 + c / kChunksPerRow;
+                const int gk = kbyte0 + (c % kChunksPerRow) * 16;
+                regs[i] = *reinterpret_cast<const uint4*>(
+                    src + static_cast<int64_t>(grow) * kbytes + gk);
+            }
+            return;
+        }
+
         #pragma unroll
         for (int i = 0; i < kPerThread; ++i) {
-            const int c = tid * kPerThread + i;
+            // A thread-strided assignment makes every load instruction cover
+            // consecutive 16-byte chunks across a wave. The thread-major
+            // order stays the default; COALESCED_STAGING opts in.
+            const int c = COALESCED_STAGING ? tid + i * THREADS
+                                             : tid * kPerThread + i;
             const int grow = row0 + c / kChunksPerRow;
             const int gk = kbyte0 + (c % kChunksPerRow) * 16;
 
@@ -61,6 +83,22 @@ struct TileStager {
                           ? *reinterpret_cast<const uint4*>(
                                 src + static_cast<int64_t>(grow) * kbytes + gk)
                           : make_uint4(0, 0, 0, 0);
+        }
+    }
+
+    // Load one physically contiguous [ROWS, BKB] activation tile. The caller
+    // supplies A as [M_tile, K_tile, ROWS, BKB], so the wave-coalesced chunk
+    // assignment becomes a dense global-memory span instead of touching four
+    // K-strided rows per wave instruction.
+    __forceinline__ __device__ void load_contiguous(
+        const uint8_t* __restrict__ tile) {
+        const int tid = threadIdx.x;
+        #pragma unroll
+        for (int i = 0; i < kPerThread; ++i) {
+            const int c = COALESCED_STAGING ? tid + i * THREADS
+                                             : tid * kPerThread + i;
+            const uint8_t* const p = tile + static_cast<int64_t>(c) * 16;
+            regs[i] = *reinterpret_cast<const uint4*>(p);
         }
     }
 
@@ -85,7 +123,8 @@ struct TileStager {
         const int tid = threadIdx.x;
         #pragma unroll
         for (int i = 0; i < kPerThread; ++i) {
-            const int c = tid * kPerThread + i;
+            const int c = COALESCED_STAGING ? tid + i * THREADS
+                                             : tid * kPerThread + i;
             uint8_t* dst = lds + (c / kChunksPerRow) * kStride + (c % kChunksPerRow) * 16;
             // 8-byte stores: kLdsPad breaks 16-byte LDS alignment.
             *reinterpret_cast<uint2*>(dst) = make_uint2(regs[i].x, regs[i].y);
@@ -108,7 +147,9 @@ struct GemmOperandA<const uint8_t*> {
 // Epi is a functor: float operator()(int row, int col, float acc) const.
 template <typename Mma, typename Epi, typename OutT,
           int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN,
-          typename ASrc = const uint8_t*>
+          typename ASrc = const uint8_t*,
+          bool COALESCED_STAGING = false, bool TILED_A = false,
+          int GROUP_M = 4>
 __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     typename GemmOperandA<ASrc>::type A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
     int M, int N, int kbytes, int ldc, Epi epi) {
@@ -142,7 +183,7 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     // Grouped block ordering for L2 locality: consecutive blocks advance along M
     // within a group of kGroupM block-rows, so concurrently resident blocks share
     // the same B columns.
-    constexpr int kGroupM = 4;
+    constexpr int kGroupM = GROUP_M;
     const int blocks_n = gridDim.x;
     const int blocks_m = gridDim.y;
     const int bid = blockIdx.y * blocks_n + blockIdx.x;
@@ -164,10 +205,15 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 
     const int row = frag_row(lane);
 
-    TileStager<BM, BKB, kThreads> sa;
-    TileStager<BN, BKB, kThreads> sb;
+    TileStager<BM, BKB, kThreads, COALESCED_STAGING> sa;
+    TileStager<BN, BKB, kThreads, COALESCED_STAGING> sb;
 
-    sa.load(A, m0, M, 0, kbytes);
+    if constexpr (TILED_A) {
+        const int64_t tile = static_cast<int64_t>(bm) * (kbytes / BKB);
+        sa.load_contiguous(A + tile * BM * BKB);
+    } else {
+        sa.load(A, m0, M, 0, kbytes);
+    }
     sb.load(B, n0, N, 0, kbytes);
     sa.store(As);
     sb.store(Bs);
@@ -179,7 +225,13 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 
         // Prefetch the next tile's global reads ahead of the current tile's math.
         if (has_next) {
-            sa.load(A, m0, M, knext, kbytes);
+            if constexpr (TILED_A) {
+                const int64_t tile =
+                    static_cast<int64_t>(bm) * (kbytes / BKB) + knext / BKB;
+                sa.load_contiguous(A + tile * BM * BKB);
+            } else {
+                sa.load(A, m0, M, knext, kbytes);
+            }
             sb.load(B, n0, N, knext, kbytes);
         }
 
@@ -229,21 +281,64 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 
     epi.init();
 
-    // Row-major writeback: the TN column tiles of one accumulator row cover
-    // TN*16 consecutive columns, keeping the stores of an iteration contiguous.
+    // Row-major writeback.
     const int col_lane = acc_col(lane);
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
+    if constexpr (requires {
+        epi.row_scale(0);
+        epi.col_scale(0);
+        epi.bias_value(0);
+        epi.apply_cached(0.0f, 0.0f, 0.0f, 0.0f);
+    }) {
+        float channel_scales[TN];
+        float channel_bias[TN];
         #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
-            if (r >= M) continue;
-            OutT* crow = C + static_cast<int64_t>(r) * ldc;
+        for (int j = 0; j < TN; ++j) {
+            const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
+            if (col < N) {
+                channel_scales[j] = epi.col_scale(col);
+                channel_bias[j] = epi.bias_value(col);
+            }
+        }
+        const bool full_output_tile = m0 + BM <= M && n0 + BN <= N;
+        auto writeback = [&]<bool FULL_TILE>() {
             #pragma unroll
-            for (int j = 0; j < TN; ++j) {
-                const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
-                if (col >= N) continue;
-                crow[col] = static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e)));
+            for (int i = 0; i < TM; ++i) {
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+                    if constexpr (!FULL_TILE) { if (r >= M) continue; }
+                    const float row_scale = epi.row_scale(r);
+                    OutT* crow = C + static_cast<int64_t>(r) * ldc;
+                    #pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
+                        if constexpr (!FULL_TILE) { if (col >= N) continue; }
+                        crow[col] = static_cast<OutT>(epi.apply_cached(
+                            Mma::get(acc[i][j], e), row_scale,
+                            channel_scales[j], channel_bias[j]));
+                    }
+                }
+            }
+        };
+        if (full_output_tile) {
+            writeback.template operator()<true>();
+        } else {
+            writeback.template operator()<false>();
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < TM; ++i) {
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+                if (r >= M) continue;
+                OutT* crow = C + static_cast<int64_t>(r) * ldc;
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
+                    if (col >= N) continue;
+                    crow[col] = static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e)));
+                }
             }
         }
     }
@@ -275,6 +370,22 @@ inline int device_wgp_count() {
     return n;
 }
 
+inline bool device_is_gfx12() {
+    constexpr int kMaxDevices = 16;
+    static std::atomic<int> cache[kMaxDevices] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return false;
+    int state = cache[dev].load(std::memory_order_relaxed);
+    if (state == 0) {
+        hipDeviceProp_t props{};
+        const bool is_gfx12 = hipGetDeviceProperties(&props, dev) == hipSuccess &&
+                              std::strncmp(props.gcnArchName, "gfx12", 5) == 0;
+        state = is_gfx12 ? 2 : 1;
+        cache[dev].store(state, std::memory_order_relaxed);
+    }
+    return state == 2;
+}
+
 // Pick and launch a tile for C[M, N] = A[M, K] @ B[N, K]^T, selecting on grid
 // coverage, K depth and warp grid. 128x128 has the best arithmetic intensity but
 // wastes the device when it yields fewer blocks than there are WGPs; BKB=128
@@ -294,6 +405,24 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
     const bool skinny = (M <= 64 || N <= 64);
 
     if (!skinny && blocks_128 >= wgps) {
+        if constexpr (std::is_same_v<Mma, MmaInt8>) {
+            const int blocks_256 = ((M + 127) / 128) * ((N + 255) / 256);
+            if (kbytes >= 1024 && blocks_256 >= wgps && device_is_gfx12()) {
+                constexpr int BM = 128, BN = 256;
+                dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+                // A deeper K stage amortizes staging on contracting projections.
+                if (kbytes > N) {
+                    gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, 128,
+                                     2, 4, 4, 4, ASrc, false, false, 8>
+                        <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+                } else {
+                    gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, 64,
+                                     2, 4, 4, 4, ASrc, false, false, 8>
+                        <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+                }
+                return;
+            }
+        }
         if (kbytes >= 4096) {
             constexpr int BM = 128, BN = 128, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);

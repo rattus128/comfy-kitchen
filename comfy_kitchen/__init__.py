@@ -57,6 +57,7 @@ else:
 __all__ = [
     # Normalization
     "adaln",
+    "rms_gated_residual",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "rms_adaln",
@@ -953,6 +954,28 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _mm_int8(a, b)
 
 
+def rms_gated_residual(
+    activation: torch.Tensor,
+    norm_weight: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1.0e-5,
+) -> torch.Tensor:
+    """Compute ``residual + gate * rms_norm(activation, norm_weight)``.
+
+    Each step is rounded to the input dtype as in the unfused PyTorch ops.
+    """
+    kwargs = {
+        "activation": activation,
+        "norm_weight": norm_weight,
+        "residual": residual,
+        "gate": gate,
+        "eps": eps,
+    }
+    impl = registry.get_implementation("rms_gated_residual", kwargs=kwargs)
+    return impl(**kwargs)
+
+
 def fp16_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1007,6 +1030,9 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    input_act_scale: torch.Tensor | None = None,
+    input_act_shift: torch.Tensor | None = None,
+    input_act_up: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -1019,13 +1045,27 @@ def int8_linear(
         convrot: If True, apply online activation rotation.
         convrot_groupsize: Group size for Hadamard rotation.
         input_act: Optional activation applied to x before quantization
-            ("gelu_tanh", "swiglu", "rms_norm", or None). When
+            ("gelu_tanh", "swiglu", "rms_norm", "adaln", or None). When
             the fused ConvRot quantizer handles the shape it is folded in, so
             an MLP's ``linear(act(proj(x)))`` or a pre-norm block's
             ``linear(rms_norm(x))`` never writes the intermediate to HBM;
-            every other path applies it eagerly for identical results.
+            every other path applies it eagerly. Fused GELU, SwiGLU and
+            RMSNorm retain FP32 activation intermediates, so results need not
+            be bit-identical to an eager chain with low-precision stores.
         input_act_weight: K-element norm weight, required for "rms_norm".
-        input_act_eps: Norm eps for "rms_norm".
+            Input and weight are independently promoted to FP32.
+        input_act_eps: Norm eps for "rms_norm" and "adaln".
+        input_act_scale: Optional modulation for "rms_norm" or "adaln":
+            ``norm(x) * (1 + input_act_scale)``. Broadcastable to x.
+            Fused RMS modulation stays in FP32. AdaLN uses the existing
+            adaln operation's precision. ConvRot's storage dtype is unchanged.
+        input_act_shift: Optional shift added after norm and optional scale.
+            Shift does not require scale.
+        input_act_up: Optional up operand for "swiglu", matching x's shape,
+            dtype and device. With it, x is the gate; without it, x contains
+            [gate | up] halves. Row-strided views of a packed projection are
+            accepted without copying by the native ConvRot quantizers.
+            Fused SiLU and the gate-up product stay in FP32.
         residual: Optional [..., N] tensor; the result becomes
             ``residual + residual_scale * linear(x)`` (a pre-norm block's
             addcmul), fused into the GEMM epilogue where supported.
@@ -1049,6 +1089,9 @@ def int8_linear(
         "input_act_eps": input_act_eps,
         "residual": residual,
         "residual_scale": residual_scale,
+        "input_act_scale": input_act_scale,
+        "input_act_shift": input_act_shift,
+        "input_act_up": input_act_up,
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)

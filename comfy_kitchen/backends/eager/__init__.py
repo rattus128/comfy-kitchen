@@ -1,5 +1,6 @@
 __all__ = [
     "adaln",
+    "rms_gated_residual",
     "fp16_conv3d",
     "fp16_conv3d_out",
     "group_norm_silu_pad3d",
@@ -102,6 +103,7 @@ from .quantization import (
     scaled_mm_nvfp4,
     stochastic_rounding_fp8,
 )
+from .residual import rms_gated_residual
 from .rope import (
     apply_rope,
     apply_rope1,
@@ -466,6 +468,16 @@ def _build_constraints() -> dict:
             "x": ParamConstraint(dtypes=standard_floats),
             "scale": ParamConstraint(dtypes=scale_values),
             "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["rms_gated_residual"] = FunctionConstraints(
+        params={
+            "activation": ParamConstraint(dtypes=standard_floats),
+            "norm_weight": ParamConstraint(dtypes=standard_floats),
+            "residual": ParamConstraint(dtypes=standard_floats),
+            "gate": ParamConstraint(dtypes=standard_floats),
+            "eps": ParamConstraint(dtypes=frozenset({float})),
         },
         default_devices=all_devices,
     )

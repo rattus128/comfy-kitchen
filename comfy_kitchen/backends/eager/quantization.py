@@ -995,6 +995,9 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    input_act_scale: torch.Tensor | None = None,
+    input_act_shift: torch.Tensor | None = None,
+    input_act_up: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
 
@@ -1019,7 +1022,7 @@ def int8_linear(
     Returns:
         Result tensor [..., N].
     """
-    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps, input_act_scale, input_act_shift, input_act_up)
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError(
             f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"

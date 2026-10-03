@@ -13,6 +13,7 @@
 // even index), which is the layout the iu4 A-fragment consumes directly.
 #pragma once
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -20,7 +21,14 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "device_arch.h"
+#include "float_math.h"
+#include "rope_math.h"
+
 namespace comfy::hip_backend {
+
+typedef __bf16 convrot_bf16x2 __attribute__((ext_vector_type(2)));
+typedef __bf16 convrot_bf16x4 __attribute__((ext_vector_type(4)));
 
 // convrot_quant_kernel handles 256/G groups per pass and rotates in log4(G)
 // stages, so a G outside this set either divides to a zero-width pass or is not
@@ -87,6 +95,10 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
     if (K == 10240) {
         return 640;
     }
+    // RDNA4 H3 tuned fused ConvRot widths.
+    if (K == 5376) return 192;
+    if (K == 7168) return 384;
+    if (K == 14336) return 640;
     return 1024;
 }
 
@@ -120,7 +132,7 @@ inline bool convrot_fused_lds_fits(int K, int block_threads, int in_dtype) {
     const size_t need =
         (static_cast<size_t>(block_threads / 32) + 1) * sizeof(float) +
         static_cast<size_t>(K) * row_element_size +
-        static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
+        static_cast<size_t>(groups_in_flight) * kConvRotGroup256 * sizeof(float);
     return need <= static_cast<size_t>(lds);
 }
 
@@ -132,6 +144,14 @@ inline int convrot_pick_fused_block_threads(int M, int K, int in_dtype) {
     }
     static constexpr int kFallbackBlocks[] = {768, 640, 512, 64};
     for (int block_threads : kFallbackBlocks) {
+        // Once a wide row can only fit the one-wave schedule, each workgroup
+        // serializes dozens of G=256 rotations. The cooperative
+        // two-pass path is the scalable fallback for these long inference
+        // rows; retain one-wave LDS for short-M calls where its launch and
+        // workspace savings still matter.
+        if (block_threads == 64 && M >= 96 && K >= 12288) {
+            continue;
+        }
         if (block_threads < preferred && convrot_fused_lds_fits(K, block_threads, in_dtype)) {
             return block_threads;
         }
@@ -190,6 +210,10 @@ template <typename Fn>
 inline void dispatch_convrot_fused_block_threads(int block_threads, Fn fn) {
     if (block_threads == 64) {
         fn.template operator()<64>();
+    } else if (block_threads == 192) {
+        fn.template operator()<192>();
+    } else if (block_threads == 384) {
+        fn.template operator()<384>();
     } else if (block_threads == 512) {
         fn.template operator()<512>();
     } else if (block_threads == 640) {
@@ -207,6 +231,13 @@ __forceinline__ __device__ float load_in(const void* x, int64_t idx, int code) {
     if (code == 1) return __half2float(static_cast<const __half*>(x)[idx]);
     return static_cast<float>(static_cast<const __bf16*>(x)[idx]);
 }
+
+struct ConvrotInput {
+    const void* gate;
+    const void* up;
+    int64_t gate_row_stride;
+    int64_t up_row_stride;
+};
 
 // Codes match comfy_kitchen.backends._activations.INPUT_ACT_TO_CODE. SwiGLU is
 // the gated pair: the raw row is [gate | up] (2*K wide) and the activated row
@@ -231,19 +262,17 @@ __forceinline__ __device__ float apply_input_act(float v) {
     return v;
 }
 
-// One activated value: column `col` of the K-wide activated row starting at
-// `in_row`. SwiGLU reads the gate at col and the up at K + col; every other
-// activation reads the same K-wide row it writes.
+// One activated value from row-strided operands. The host resolves packed
+// SwiGLU input into gate/up pointers before launching this same kernel.
 template <int ACT>
 __forceinline__ __device__ float load_input_act(
-    const void* x, int64_t in_row, int col, int K, int code) {
+    ConvrotInput input, int row, int col, int code) {
     if constexpr (ACT == kActSwiGLU) {
-        // Matches torch silu(gate) * up.
-        const float gate = load_in(x, in_row + col, code);
-        const float up = load_in(x, in_row + K + col, code);
+        const float gate = load_in(input.gate, static_cast<int64_t>(row) * input.gate_row_stride + col, code);
+        const float up = load_in(input.up, static_cast<int64_t>(row) * input.up_row_stride + col, code);
         return (gate / (1.0f + expf(-gate))) * up;
     } else {
-        return apply_input_act<ACT>(load_in(x, in_row + col, code));
+        return apply_input_act<ACT>(load_in(input.gate, static_cast<int64_t>(row) * input.gate_row_stride + col, code));
     }
 }
 
@@ -256,6 +285,47 @@ __forceinline__ __device__ void load_input_act4_bf16(
     o1 = static_cast<float>(elems[1]);
     o2 = static_cast<float>(elems[2]);
     o3 = static_cast<float>(elems[3]);
+}
+
+__forceinline__ __device__ void load_input_swiglu4_bf16(
+    ConvrotInput input, int row, int col,
+    float& o0, float& o1, float& o2, float& o3) {
+    const __bf16* gate = static_cast<const __bf16*>(input.gate) +
+        static_cast<int64_t>(row) * input.gate_row_stride + col;
+    const __bf16* up = static_cast<const __bf16*>(input.up) +
+        static_cast<int64_t>(row) * input.up_row_stride + col;
+
+    float g0, g1, g2, g3;
+    float u0, u1, u2, u3;
+    const std::uintptr_t gate_addr = reinterpret_cast<std::uintptr_t>(gate);
+    const std::uintptr_t up_addr = reinterpret_cast<std::uintptr_t>(up);
+    if (((gate_addr | up_addr) & 7u) == 0) {
+        const uint64_t gate_pack = *reinterpret_cast<const uint64_t*>(gate);
+        const uint64_t up_pack = *reinterpret_cast<const uint64_t*>(up);
+        const __bf16* gate_elems = reinterpret_cast<const __bf16*>(&gate_pack);
+        const __bf16* up_elems = reinterpret_cast<const __bf16*>(&up_pack);
+        g0 = static_cast<float>(gate_elems[0]);
+        g1 = static_cast<float>(gate_elems[1]);
+        g2 = static_cast<float>(gate_elems[2]);
+        g3 = static_cast<float>(gate_elems[3]);
+        u0 = static_cast<float>(up_elems[0]);
+        u1 = static_cast<float>(up_elems[1]);
+        u2 = static_cast<float>(up_elems[2]);
+        u3 = static_cast<float>(up_elems[3]);
+    } else {
+        g0 = static_cast<float>(gate[0]);
+        g1 = static_cast<float>(gate[1]);
+        g2 = static_cast<float>(gate[2]);
+        g3 = static_cast<float>(gate[3]);
+        u0 = static_cast<float>(up[0]);
+        u1 = static_cast<float>(up[1]);
+        u2 = static_cast<float>(up[2]);
+        u3 = static_cast<float>(up[3]);
+    }
+    o0 = (g0 / (1.0f + expf(-g0))) * u0;
+    o1 = (g1 / (1.0f + expf(-g1))) * u1;
+    o2 = (g2 / (1.0f + expf(-g2))) * u2;
+    o3 = (g3 / (1.0f + expf(-g3))) * u3;
 }
 
 template <typename RowT>
@@ -406,7 +476,7 @@ __forceinline__ __device__ float finite_absmax_for_quant(float abs_max) {
     return abs_max;
 }
 
-constexpr int kConvrotGlobalGroupsPerBlock = 8;
+constexpr int kConvrotGlobalGroupsPerBlock = 4;
 constexpr int kConvrotGlobalBlockThreads = kConvrotGlobalGroupsPerBlock * 64;
 constexpr size_t kConvrotGlobalSmemBytes =
     static_cast<size_t>(kConvrotGlobalGroupsPerBlock) * 2 * kConvRotGroup256 * sizeof(float);
@@ -415,7 +485,7 @@ constexpr size_t kConvrotGlobalSmemBytes =
 // quantize in a second kernel. Fixed 16 KiB LDS regardless of K.
 template <int GROUPS_PER_BLOCK, typename RowT, int ACT>
 __global__ __launch_bounds__(GROUPS_PER_BLOCK* 64) void convrot_rotate_groups64_amax_kernel(
-    const void* __restrict__ x, int in_dtype, RowT* __restrict__ rotated,
+    ConvrotInput input, int in_dtype, RowT* __restrict__ rotated,
     float* __restrict__ partial_absmax, int K) {
     constexpr int kGroupThreads = 64;
     extern __shared__ float smem[];
@@ -427,7 +497,7 @@ __global__ __launch_bounds__(GROUPS_PER_BLOCK* 64) void convrot_rotate_groups64_
     const int n_groups = K / kConvRotGroup256;
     const bool active = group < n_groups;
     const int64_t row_offset = row * K;
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    constexpr int kInWidth = ACT == kActSwiGLU ? 2 : 1;
     const int64_t in_row_offset = row_offset * kInWidth;
     const int group_col = group * kConvRotGroup256;
 
@@ -443,18 +513,18 @@ __global__ __launch_bounds__(GROUPS_PER_BLOCK* 64) void convrot_rotate_groups64_
     if (active) {
         if constexpr (ACT == kActNone) {
             if (in_dtype == 2) {
-                load_input_act4_bf16(x, in_row_offset, col, xv0, xv1, xv2, xv3);
+                load_input_act4_bf16(input.gate, in_row_offset, col, xv0, xv1, xv2, xv3);
             } else {
-                xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
-                xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
-                xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
-                xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+                xv0 = load_input_act<ACT>(input, row, col, in_dtype);
+                xv1 = load_input_act<ACT>(input, row, col + 1, in_dtype);
+                xv2 = load_input_act<ACT>(input, row, col + 2, in_dtype);
+                xv3 = load_input_act<ACT>(input, row, col + 3, in_dtype);
             }
         } else {
-            xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
-            xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
-            xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
-            xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+            xv0 = load_input_act<ACT>(input, row, col, in_dtype);
+            xv1 = load_input_act<ACT>(input, row, col + 1, in_dtype);
+            xv2 = load_input_act<ACT>(input, row, col + 2, in_dtype);
+            xv3 = load_input_act<ACT>(input, row, col + 3, in_dtype);
         }
     }
     buf1[base] = 0.5f * (xv0 + xv1 + xv2 - xv3);
@@ -490,7 +560,8 @@ __global__ __launch_bounds__(GROUPS_PER_BLOCK* 64) void convrot_rotate_groups64_
 template <typename RowT, int BLOCK_THREADS>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_from_partials_kernel(
     const RowT* __restrict__ rotated, const float* __restrict__ partial_absmax,
-    int8_t* __restrict__ qout, float* __restrict__ scaleout, int K) {
+    int8_t* __restrict__ qout, float* __restrict__ scaleout, int K,
+    bool tiled_output) {
     constexpr int kWarps = BLOCK_THREADS / kWarpSize;
     __shared__ float warp_smem[kWarps];
     __shared__ float block_smem;
@@ -517,44 +588,50 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_from_partials_ker
         const float v = load_row_value<RowT>(rotated[row_offset + col]);
         int q = static_cast<int>(rintf(v * inv));
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
-        qout[row_offset + col] = static_cast<int8_t>(q);
+        const int64_t qindex = tiled_output
+            ? static_cast<int64_t>(row >> 7) * K * 128 +
+                  static_cast<int64_t>(col >> 7) * 128 * 128 +
+                  (row & 127) * 128 + (col & 127)
+            : row_offset + col;
+        qout[qindex] = static_cast<int8_t>(q);
     }
 }
 
 template <typename RowT, int ACT>
 inline void launch_convrot_quant_global(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
-    RowT* rotated, float* partial_absmax, hipStream_t stream) {
+    ConvrotInput input, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
+    RowT* rotated, float* partial_absmax, hipStream_t stream,
+    bool tiled_output) {
     const int n_groups = K / kConvRotGroup256;
     const int group_blocks =
         (n_groups + kConvrotGlobalGroupsPerBlock - 1) / kConvrotGlobalGroupsPerBlock;
     const dim3 rotate_grid(static_cast<unsigned int>(M), static_cast<unsigned int>(group_blocks));
     convrot_rotate_groups64_amax_kernel<kConvrotGlobalGroupsPerBlock, RowT, ACT>
         <<<rotate_grid, kConvrotGlobalBlockThreads, kConvrotGlobalSmemBytes, stream>>>(
-            x, in_dtype, rotated, partial_absmax, K);
+            input, in_dtype, rotated, partial_absmax, K);
 
     const int quant_threads = K >= 4096 ? 512 : 256;
     if (quant_threads == 512) {
         convrot_quant_from_partials_kernel<RowT, 512>
-            <<<M, 512, 0, stream>>>(rotated, partial_absmax, qout, scaleout, K);
+            <<<M, 512, 0, stream>>>(rotated, partial_absmax, qout, scaleout, K, tiled_output);
     } else {
         convrot_quant_from_partials_kernel<RowT, 256>
-            <<<M, 256, 0, stream>>>(rotated, partial_absmax, qout, scaleout, K);
+            <<<M, 256, 0, stream>>>(rotated, partial_absmax, qout, scaleout, K, tiled_output);
     }
 }
 
 template <int ACT>
 void launch_convrot_quant_global_managed(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K, hipStream_t stream,
-    void* spill_rotated, void* spill_partials);
+    ConvrotInput input, int in_dtype, int8_t* qout, float* scaleout, int M, int K, hipStream_t stream,
+    void* spill_rotated, void* spill_partials, bool tiled_output);
 
 // Fused single-kernel path: FHT in LDS, vectorized loads, warp-shuffle absmax.
 // One block per row; the rotated row stays in shared memory as RowT.
-template <typename RowT, int BLOCK_THREADS, int ACT>
+template <typename RowT, int BLOCK_THREADS, int ACT, bool TILED_OUTPUT = false>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
-    const void* __restrict__ x, int in_dtype, int8_t* __restrict__ qout,
+    ConvrotInput input, int in_dtype, int8_t* __restrict__ qout,
     float* __restrict__ scaleout, int M, int K, const void* __restrict__ act_weight,
-    float act_eps) {
+    float act_eps, int act_weight_code) {
 
     constexpr int kGroupThreads = 64;
     constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
@@ -572,12 +649,12 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     const int sub = tid / kGroupThreads;
     const int lane = tid % kGroupThreads;
     const int64_t row_offset = static_cast<int64_t>(row) * K;
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    constexpr int kInWidth = ACT == kActSwiGLU ? 2 : 1;
     const int64_t in_row_offset = row_offset * kInWidth;
     const int n_groups = K / kConvRotGroup256;
 
-    float* buf0 = tmp + sub * (2 * kConvRotGroup256);
-    float* buf1 = buf0 + kConvRotGroup256;
+    // S4/S16 stay in registers; only the S16->S64 handoff needs LDS.
+    float* buf1 = tmp + sub * kConvRotGroup256;
     float abs_max = 0.0f;
 
     // RmsNorm needs the row's mean square before the first group.
@@ -585,7 +662,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     if constexpr (ACT == kActRmsNorm) {
         float sum_sq = 0.0f;
         for (int c = tid; c < K; c += BLOCK_THREADS) {
-            const float v = load_row_value(static_cast<const RowT*>(x)[row_offset + c]);
+            const float v = load_row_value(static_cast<const RowT*>(input.gate)[row_offset + c]);
             sum_sq += v * v;
         }
         sum_sq = block_reduce_sum<kWarps>(sum_sq, warp_smem, &block_smem);
@@ -606,37 +683,203 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
         float xv3 = 0.0f;
         if (active) {
             if constexpr (ACT == kActRmsNorm) {
-                const RowT* xr = static_cast<const RowT*>(x) + in_row_offset;
-                const RowT* wr = static_cast<const RowT*>(act_weight);
-                xv0 = load_row_value(xr[col]) * rstd * load_row_value(wr[col]);
-                xv1 = load_row_value(xr[col + 1]) * rstd * load_row_value(wr[col + 1]);
-                xv2 = load_row_value(xr[col + 2]) * rstd * load_row_value(wr[col + 2]);
-                xv3 = load_row_value(xr[col + 3]) * rstd * load_row_value(wr[col + 3]);
+                const RowT* xr = static_cast<const RowT*>(input.gate) + in_row_offset;
+                auto normalized = [&](int c) {
+                    return load_row_value(xr[c]) * rstd * load_in(act_weight, c, act_weight_code);
+                };
+                xv0 = normalized(col);
+                xv1 = normalized(col + 1);
+                xv2 = normalized(col + 2);
+                xv3 = normalized(col + 3);
             } else if constexpr (ACT == kActNone) {
                 if (in_dtype == 2) {
-                    load_input_act4_bf16(x, in_row_offset, col, xv0, xv1, xv2, xv3);
+                    load_input_act4_bf16(input.gate, in_row_offset, col, xv0, xv1, xv2, xv3);
                 } else {
-                    xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
-                    xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
-                    xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
-                    xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+                    xv0 = load_input_act<ACT>(input, row, col, in_dtype);
+                    xv1 = load_input_act<ACT>(input, row, col + 1, in_dtype);
+                    xv2 = load_input_act<ACT>(input, row, col + 2, in_dtype);
+                    xv3 = load_input_act<ACT>(input, row, col + 3, in_dtype);
                 }
             } else {
-                xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
-                xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
-                xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
-                xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+                if constexpr (ACT == kActSwiGLU && std::is_same_v<RowT, __bf16>) {
+                    load_input_swiglu4_bf16(input, row, col, xv0, xv1, xv2, xv3);
+                } else {
+                    xv0 = load_input_act<ACT>(input, row, col, in_dtype);
+                    xv1 = load_input_act<ACT>(input, row, col + 1, in_dtype);
+                    xv2 = load_input_act<ACT>(input, row, col + 2, in_dtype);
+                    xv3 = load_input_act<ACT>(input, row, col + 3, in_dtype);
+                }
             }
         }
-        buf1[base] = 0.5f * (xv0 + xv1 + xv2 - xv3);
-        buf1[base + 1] = 0.5f * (xv0 + xv1 - xv2 + xv3);
-        buf1[base + 2] = 0.5f * (xv0 - xv1 + xv2 + xv3);
-        buf1[base + 3] = 0.5f * (-xv0 + xv1 + xv2 + xv3);
-        __syncthreads();
+        // Prevent fast-math reassociation across SwiGLU -> Hadamard boundary.
+        __asm__ __volatile__(
+            "" :
+            "+v"(xv0), "+v"(xv1), "+v"(xv2), "+v"(xv3));
 
-        convrot_fht_stage64<4>(buf1, buf0, lane);
-        __syncthreads();
-        convrot_fht_stage64<16>(buf0, buf1, lane);
+        // First radix-4 result remains in registers.
+        float a0 = 0.5f * (xv0 + xv1 + xv2 - xv3);
+        float a1 = 0.5f * (xv0 + xv1 - xv2 + xv3);
+        float a2 = 0.5f * (xv0 - xv1 + xv2 + xv3);
+        float a3 = 0.5f * (-xv0 + xv1 + xv2 + xv3);
+
+        // Preserve the old LDS store/load arithmetic boundary.
+        __asm__ __volatile__(
+            "" :
+            "+v"(a0), "+v"(a1), "+v"(a2), "+v"(a3));
+
+        // 4x4 register transpose inside each 4-lane subgroup.
+        //
+        // Stage 1 swaps lane bit 0 with component bit 0.
+        const float p0 = __shfl_xor(a0, 1, 4);
+        const float p1 = __shfl_xor(a1, 1, 4);
+        const float p2 = __shfl_xor(a2, 1, 4);
+        const float p3 = __shfl_xor(a3, 1, 4);
+
+        float b0, b1, b2, b3;
+        if ((lane & 1) == 0) {
+            b0 = a0;
+            b1 = p0;
+            b2 = a2;
+            b3 = p2;
+        } else {
+            b0 = p1;
+            b1 = a1;
+            b2 = p3;
+            b3 = a3;
+        }
+
+        // Stage 2 swaps lane bit 1 with component bit 1.
+        const float q0 = __shfl_xor(b0, 2, 4);
+        const float q1 = __shfl_xor(b1, 2, 4);
+        const float q2 = __shfl_xor(b2, 2, 4);
+        const float q3 = __shfl_xor(b3, 2, 4);
+
+        float x0, x1, x2, x3;
+        if ((lane & 2) == 0) {
+            x0 = b0;
+            x1 = b1;
+            x2 = q0;
+            x3 = q1;
+        } else {
+            x0 = q2;
+            x1 = q3;
+            x2 = b2;
+            x3 = b3;
+        }
+
+        // Match the former S=4 LDS-load boundary under -ffast-math.
+        __asm__ __volatile__(
+            "" :
+            "+v"(x0), "+v"(x1), "+v"(x2), "+v"(x3));
+
+        // Keep the exact original S=4 arithmetic, but keep its outputs
+        // in registers instead of round-tripping through LDS.
+        float c0 = 0.5f * (x0 + x1 + x2 - x3);
+        float c1 = 0.5f * (x0 + x1 - x2 + x3);
+        float c2 = 0.5f * (x0 - x1 + x2 + x3);
+        float c3 = 0.5f * (-x0 + x1 + x2 + x3);
+
+        // Preserve the former S=4 LDS store/load compiler boundary.
+        __asm__ __volatile__(
+            "" :
+            "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3));
+
+        // S=16 needs a second 4x4 transpose.
+        // This time the four producer lanes are spaced 4 lanes apart:
+        // r, r+4, r+8, r+12 inside each 16-lane subgroup.
+
+        const float s16_p0 = __shfl_xor(c0, 4, 16);
+        const float s16_p1 = __shfl_xor(c1, 4, 16);
+        const float s16_p2 = __shfl_xor(c2, 4, 16);
+        const float s16_p3 = __shfl_xor(c3, 4, 16);
+
+        float d0, d1, d2, d3;
+
+        if ((lane & 4) == 0) {
+            d0 = c0;
+            d1 = s16_p0;
+            d2 = c2;
+            d3 = s16_p2;
+        } else {
+            d0 = s16_p1;
+            d1 = c1;
+            d2 = s16_p3;
+            d3 = c3;
+        }
+
+        const float s16_q0 = __shfl_xor(d0, 8, 16);
+        const float s16_q1 = __shfl_xor(d1, 8, 16);
+        const float s16_q2 = __shfl_xor(d2, 8, 16);
+        const float s16_q3 = __shfl_xor(d3, 8, 16);
+
+        float u0, u1, u2, u3;
+
+        if ((lane & 8) == 0) {
+            u0 = d0;
+            u1 = d1;
+            u2 = s16_q0;
+            u3 = s16_q1;
+        } else {
+            u0 = s16_q2;
+            u1 = s16_q3;
+            u2 = d2;
+            u3 = d3;
+        }
+
+        // Match the former S=16 LDS-load arithmetic boundary.
+        __asm__ __volatile__(
+            "" :
+            "+v"(u0), "+v"(u1), "+v"(u2), "+v"(u3));
+
+        const int s16_base =
+            (lane % 16) + (lane / 16) * 64;
+
+        // Force the original left-to-right FP operation order.
+        // Empty +v asm barriers prevent -ffast-math reassociation
+        // inside each H4 expression without changing the data path.
+
+        float s16_t00 = u0 + u1;
+        __asm__ __volatile__("" : "+v"(s16_t00));
+        float s16_t01 = s16_t00 + u2;
+
+        float s16_t02 = s16_t01 - u3;
+
+        float s16_y0 = 0.5f * s16_t02;
+
+        float s16_t10 = u0 + u1;
+        __asm__ __volatile__("" : "+v"(s16_t10));
+        float s16_t11 = s16_t10 - u2;
+        __asm__ __volatile__("" : "+v"(s16_t11));
+
+        float s16_t12 = s16_t11 + u3;
+
+        float s16_y1 = 0.5f * s16_t12;
+
+        float s16_t20 = u0 - u1;
+        __asm__ __volatile__("" : "+v"(s16_t20));
+        float s16_t21 = s16_t20 + u2;
+
+        float s16_t22 = s16_t21 + u3;
+
+        float s16_y2 = 0.5f * s16_t22;
+
+        float s16_t30 = -u0;
+        __asm__ __volatile__("" : "+v"(s16_t30));
+        float s16_t31 = s16_t30 + u1;
+        __asm__ __volatile__("" : "+v"(s16_t31));
+        float s16_t32 = s16_t31 + u2;
+
+        float s16_t33 = s16_t32 + u3;
+
+        float s16_y3 = 0.5f * s16_t33;
+
+        buf1[s16_base]      = s16_y0;
+        buf1[s16_base + 16] = s16_y1;
+        buf1[s16_base + 32] = s16_y2;
+        buf1[s16_base + 48] = s16_y3;
+
+        // S=64 consumes values produced by both waves of the 64-thread
+        // subgroup, so this one must remain a full-block barrier.
         __syncthreads();
 
         if (active) {
@@ -660,33 +903,39 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
         const float v = load_row_value(row_buf[col]);
         int q = static_cast<int>(rintf(v * inv));
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
-        qout[row_offset + col] = static_cast<int8_t>(q);
+        const int64_t qindex = TILED_OUTPUT
+            ? static_cast<int64_t>(row >> 7) * K * 128 +
+                  static_cast<int64_t>(col >> 7) * 128 * 128 +
+                  (row & 127) * 128 + (col & 127)
+            : row_offset + col;
+        qout[qindex] = static_cast<int8_t>(q);
     }
 }
 
 template <typename RowT, int ACT, int BLOCK_THREADS>
 inline bool launch_convrot_quant_fused_impl(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
-    const void* act_weight, float act_eps, hipStream_t stream) {
+    ConvrotInput input, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
+    const void* act_weight, float act_eps, hipStream_t stream, bool tiled_output, int act_weight_code) {
     const int groups_in_flight = BLOCK_THREADS / 64;
     const size_t shmem =
         static_cast<size_t>(K) * sizeof(RowT) +
-        static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
+        static_cast<size_t>(groups_in_flight) * kConvRotGroup256 * sizeof(float);
     auto kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT>;
+    if (tiled_output) kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT, true>;
     const hipError_t attr_err = hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(shmem));
     if (attr_err != hipSuccess) {
         return false;
     }
-    kernel<<<M, BLOCK_THREADS, shmem, stream>>>(x, in_dtype, qout, scaleout, M, K, act_weight,
-                                                act_eps);
+    kernel<<<M, BLOCK_THREADS, shmem, stream>>>(input, in_dtype, qout, scaleout, M, K, act_weight,
+                                                act_eps, act_weight_code);
     return hipGetLastError() == hipSuccess;
 }
 
 template <typename RowT, int ACT>
 struct LaunchConvrotQuantFusedForBlock {
-    const void* x;
+    ConvrotInput input;
     int in_dtype;
     int8_t* qout;
     float* scaleout;
@@ -694,19 +943,21 @@ struct LaunchConvrotQuantFusedForBlock {
     int K;
     const void* act_weight;
     float act_eps;
+    bool tiled_output;
     hipStream_t stream;
     bool* launched;
+    int act_weight_code;
 
     template <int BLOCK_THREADS>
     void operator()() const {
         *launched = launch_convrot_quant_fused_impl<RowT, ACT, BLOCK_THREADS>(
-            x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream);
+            input, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, tiled_output, act_weight_code);
     }
 };
 
 template <int ACT>
 struct LaunchConvrotQuantFusedForRow {
-    const void* x;
+    ConvrotInput input;
     int in_dtype;
     int8_t* qout;
     float* scaleout;
@@ -714,22 +965,25 @@ struct LaunchConvrotQuantFusedForRow {
     int K;
     const void* act_weight;
     float act_eps;
+    bool tiled_output;
     hipStream_t stream;
     int block_threads;
     bool* launched;
+    int act_weight_code = 0;
 
     template <typename RowT>
     void operator()() const {
         dispatch_convrot_fused_block_threads(
             block_threads,
             LaunchConvrotQuantFusedForBlock<RowT, ACT>{
-                x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, launched});
+                input, in_dtype, qout, scaleout, M, K, act_weight, act_eps, tiled_output, stream,
+                launched, act_weight_code});
     }
 };
 
 template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
-    const void* __restrict__ x, int in_dtype,
+    ConvrotInput input, int in_dtype,
     int8_t* __restrict__ qout, float* __restrict__ scaleout,
     int M, int K, int G) {
 
@@ -751,15 +1005,12 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
     const int gbase_idx = glocal * G;
     const float norm = rsqrtf(static_cast<float>(G));
     const int ngrp = K / G;
-    // SwiGLU reads a [gate | up] raw row twice as wide as the K it writes.
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
-    const int64_t in_row = static_cast<int64_t>(row) * K * kInWidth;
 
     float lmax = 0.0f;
     for (int gbase = 0; gbase < ngrp; gbase += gpw) {
         const int grp = gbase + glocal;
         const bool active = grp < ngrp;
-        g[t] = active ? load_input_act<ACT>(x, in_row, grp * G + e, K, in_dtype) : 0.0f;
+        g[t] = active ? load_input_act<ACT>(input, row, grp * G + e, in_dtype) : 0.0f;
         __syncthreads();
 
         for (int stage = 0; stage < nstages; ++stage) {
@@ -817,19 +1068,435 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
     }
 }
 
+// Wide-row ConvRot-256: packed eight-group or scalar four-group passes.
+// Keep separate from convrot_quant_kernel to preserve its rounding schedule.
+template <int ACT, bool TILED_QOUT = false>
+__global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
+    ConvrotInput input_operand, const void* __restrict__ auxiliary,
+    int8_t* __restrict__ qout, float* __restrict__ scaleout,
+    int K, const void* __restrict__ norm_weight = nullptr,
+    float rms_eps = 0.0f, const void* __restrict__ shift = nullptr,
+    int norm_weight_code = 2) {
+
+    static_assert(ACT == kActNone || ACT == kActSwiGLU || ACT == kActRmsNorm);
+
+    constexpr int kThreads = 512;
+    constexpr int kGroup = 256;
+    constexpr int kGroupsPerThread = 2;
+    constexpr int kGroupsPerSlot = kThreads / kGroup;
+    constexpr int kGroupsPerPass = kGroupsPerSlot * kGroupsPerThread;
+    const float h4[4][4] = {
+        {1, 1, 1, -1},
+        {1, 1, -1, 1},
+        {1, -1, 1, 1},
+        {-1, 1, 1, 1},
+    };
+
+    __shared__ float stage_storage[2 * kThreads * kGroupsPerThread];
+    float (*stage)[kThreads * kGroupsPerThread] =
+        reinterpret_cast<float (*)[kThreads * kGroupsPerThread]>(stage_storage);
+    __shared__ float wave_max[kThreads / 32];
+    extern __shared__ unsigned char rowbuf_raw[];
+    __bf16* rowbuf = reinterpret_cast<__bf16*>(rowbuf_raw);
+
+    const int row = blockIdx.x;
+    const int t = threadIdx.x;
+    const int lane = t & 31;
+    const int wave = t >> 5;
+    const int local_group = t / kGroup;
+    const int element = t % kGroup;
+    const int group_count = K / kGroup;
+    // Tile-major INT8 output is [M_tile, K_tile, row_in_tile, K_in_tile],
+    // so the tile-major GEMM reads each 128x128 tile contiguously.
+    const int64_t qout_row_base = TILED_QOUT
+        ? static_cast<int64_t>(row >> 7) * K * 128 + (row & 127) * 128
+        : static_cast<int64_t>(row) * K;
+    constexpr int kInputWidth = ACT == kActSwiGLU ? 2 : 1;
+    const int64_t input_row = static_cast<int64_t>(row) * K * kInputWidth;
+    const float norm = rsqrtf(static_cast<float>(kGroup));
+
+    float row_rstd = 0.0f;
+    if constexpr (ACT == kActRmsNorm) {
+        #pragma clang fp reassociate(off)
+        #pragma clang fp contract(on)
+        #pragma clang fp reciprocal(off)
+        // Match PyTorch's vectorized RMSNorm reduction order.
+        // Only the first eight waves participate, reproducing its 32x8
+        // workgroup and four-BF16 vector ownership.  The same loads also
+        // seed the existing BF16 row buffer for the ConvRot pass.
+        float sum_sq = 0.0f;
+        if (t < 256) {
+            const auto* input_vectors =
+                reinterpret_cast<const convrot_bf16x4*>(
+                    static_cast<const __bf16*>(input_operand.gate) + input_row);
+            auto* row_vectors =
+                reinterpret_cast<convrot_bf16x4*>(rowbuf);
+            for (int vector = t; vector < K / 4; vector += 256) {
+                const convrot_bf16x4 values = input_vectors[vector];
+                row_vectors[vector] = values;
+                #pragma unroll
+                for (int element4 = 0; element4 < 4; ++element4) {
+                    const float value =
+                        static_cast<float>(values[element4]);
+                    sum_sq += value * value;
+                }
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sum_sq += __shfl_down(sum_sq, offset, 32);
+            }
+        }
+
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            if (lane == 0 && wave < 8 && wave >= offset &&
+                wave < 2 * offset) {
+                wave_max[wave - offset] = sum_sq;
+            }
+            __syncthreads();
+            if (lane == 0 && wave < offset) {
+                sum_sq += wave_max[wave];
+            }
+            __syncthreads();
+        }
+        if (t == 0) {
+            const float mean_square =
+                ieee_div_f32(sum_sq, static_cast<float>(K));
+            wave_max[0] = __ocml_rsqrt_f32(mean_square + rms_eps);
+        }
+        __syncthreads();
+        row_rstd = wave_max[0];
+    }
+    float local_max = 0.0f;
+    if constexpr (ACT != kActSwiGLU || TILED_QOUT) {
+        // Eight ConvRot-256 groups per pass: radix 0 is register-local, 1/2
+        // stay in-wave, only radix 3 uses LDS. Same 8-KiB ping-pong stage
+        // as the four-group schedule (one visibility + one reuse barrier).
+        constexpr int kPackedElements = 4;
+        constexpr int kPackedThreadsPerGroup = kGroup / kPackedElements;
+        constexpr int kPackedGroupsPerPass = kThreads / kPackedThreadsPerGroup;
+        float* packed_stage = stage_storage;
+        const int packed_local_group = t / kPackedThreadsPerGroup;
+        const int packed_thread = t % kPackedThreadsPerGroup;
+        const int element_base = packed_thread * kPackedElements;
+
+        for (int group_base = 0; group_base < group_count;
+             group_base += kPackedGroupsPerPass) {
+            const int group = group_base + packed_local_group;
+            const bool active = group < group_count;
+            float transformed[kPackedElements] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (active) {
+                const int64_t index = input_row + group * kGroup + element_base;
+                float input[kPackedElements];
+                if constexpr (ACT == kActRmsNorm) {
+                    const int column = group * kGroup + element_base;
+                    const convrot_bf16x4 values =
+                        *reinterpret_cast<const convrot_bf16x4*>(rowbuf + column);
+                    convrot_bf16x4 modulation;
+                    if (auxiliary) {
+                        modulation = *reinterpret_cast<const convrot_bf16x4*>(
+                            static_cast<const __bf16*>(auxiliary) + column);
+                    }
+                    convrot_bf16x4 shifts;
+                    if (shift) {
+                        shifts = *reinterpret_cast<const convrot_bf16x4*>(
+                            static_cast<const __bf16*>(shift) + column);
+                    }
+                    #pragma unroll
+                    for (int element4 = 0; element4 < kPackedElements; ++element4) {
+                        float normalized =
+                            row_rstd * static_cast<float>(values[element4]);
+                        asm volatile("" : "+v"(normalized));
+                        normalized *= load_in(norm_weight, column + element4, norm_weight_code);
+                        if (auxiliary) {
+                            normalized *= 1.0f + static_cast<float>(modulation[element4]);
+                        }
+                        if (shift) {
+                            normalized += static_cast<float>(shifts[element4]);
+                        }
+                        input[element4] = normalized;
+                    }
+                } else if constexpr (ACT == kActSwiGLU) {
+                    #pragma unroll
+                    for (int element4 = 0; element4 < kPackedElements; ++element4) {
+                        input[element4] = load_input_act<ACT>(
+                            input_operand, row, group * kGroup + element_base + element4,
+                            2);
+                        // The unpacked schedule materializes this FP32 result
+                        // before a shuffle; do not contract it into radix 0.
+                        asm volatile("" : "+v"(input[element4]));
+                    }
+                } else {
+                    const convrot_bf16x4 values =
+                        *reinterpret_cast<const convrot_bf16x4*>(
+                            static_cast<const __bf16*>(input_operand.gate) + index);
+                    #pragma unroll
+                    for (int element4 = 0; element4 < kPackedElements; ++element4) {
+                        input[element4] = static_cast<float>(values[element4]);
+                    }
+                }
+                #pragma unroll
+                for (int digit = 0; digit < 4; ++digit) {
+                    if constexpr (ACT == kActSwiGLU) {
+                        #pragma clang fp reassociate(off)
+                        transformed[digit] =
+                            h4[digit][0] * input[0] + h4[digit][1] * input[1] +
+                            h4[digit][2] * input[2] + h4[digit][3] * input[3];
+                    } else {
+                        transformed[digit] =
+                            h4[digit][0] * input[0] + h4[digit][1] * input[1] +
+                            h4[digit][2] * input[2] + h4[digit][3] * input[3];
+                    }
+                }
+            }
+
+            // Radix 1: four adjacent physical threads own the four inputs.
+            const int digit1 = packed_thread & 3;
+            const int base1 = lane - digit1;
+            #pragma unroll
+            for (int element4 = 0; element4 < kPackedElements; ++element4) {
+                const float v0 = __shfl(transformed[element4], base1, 32);
+                const float v1 = __shfl(transformed[element4], base1 + 1, 32);
+                const float v2 = __shfl(transformed[element4], base1 + 2, 32);
+                const float v3 = __shfl(transformed[element4], base1 + 3, 32);
+                transformed[element4] =
+                    h4[digit1][0] * v0 + h4[digit1][1] * v1 +
+                    h4[digit1][2] * v2 + h4[digit1][3] * v3;
+            }
+
+            // Radix 2: the four source threads are still in one wave.
+            const int digit2 = (packed_thread >> 2) & 3;
+            const int base2 = lane - digit2 * 4;
+            #pragma unroll
+            for (int element4 = 0; element4 < kPackedElements; ++element4) {
+                const float v0 = __shfl(transformed[element4], base2, 32);
+                const float v1 = __shfl(transformed[element4], base2 + 4, 32);
+                const float v2 = __shfl(transformed[element4], base2 + 8, 32);
+                const float v3 = __shfl(transformed[element4], base2 + 12, 32);
+                transformed[element4] =
+                    h4[digit2][0] * v0 + h4[digit2][1] * v1 +
+                    h4[digit2][2] * v2 + h4[digit2][3] * v3;
+                packed_stage[packed_local_group * kGroup + element_base + element4] =
+                    transformed[element4];
+            }
+            __syncthreads();
+
+            // Radix 3 crosses the two waves assigned to this group.
+            const int digit3 = (packed_thread >> 4) & 3;
+            const int base3 = packed_local_group * kGroup + element_base - digit3 * 64;
+            #pragma unroll
+            for (int element4 = 0; element4 < kPackedElements; ++element4) {
+                const float v0 = packed_stage[base3 + element4];
+                const float v1 = packed_stage[base3 + 64 + element4];
+                const float v2 = packed_stage[base3 + 128 + element4];
+                const float v3 = packed_stage[base3 + 192 + element4];
+                transformed[element4] =
+                    h4[digit3][0] * v0 + h4[digit3][1] * v1 +
+                    h4[digit3][2] * v2 + h4[digit3][3] * v3;
+                if (active) {
+                    // round_bf16: the row max must be taken over the stored
+                    // BF16 values, and -ffast-math folds a __bf16 round trip.
+                    const float stored =
+                        round_bf16(transformed[element4] * norm);
+                    rowbuf[static_cast<int64_t>(group) * kGroup + element_base + element4] =
+                        static_cast<__bf16>(stored);
+                    local_max = fmaxf(local_max, fabsf(stored));
+                }
+            }
+            if (group_base + kPackedGroupsPerPass < group_count) {
+                __syncthreads();
+            }
+        }
+    } else {
+    for (int group_base = 0; group_base < group_count;
+         group_base += kGroupsPerPass) {
+        float transformed[kGroupsPerThread];
+        bool active[kGroupsPerThread];
+
+        #pragma unroll
+        for (int slot = 0; slot < kGroupsPerThread; ++slot) {
+            const int group =
+                group_base + local_group + slot * kGroupsPerSlot;
+            active[slot] = group < group_count;
+            if (!active[slot]) {
+                transformed[slot] = 0.0f;
+            } else {
+                transformed[slot] = load_input_act<ACT>(
+                    input_operand, row, group * kGroup + element, 2);
+            }
+        }
+
+        // Radix stages 0 and 1 never leave their aligned 16-lane subgroup.
+        #pragma unroll
+        for (int radix_stage = 0; radix_stage < 2; ++radix_stage) {
+            const int stride = 1 << (2 * radix_stage);
+            const int digit = (element / stride) & 3;
+            const int base = (element & 15) - digit * stride;
+            #pragma unroll
+            for (int slot = 0; slot < kGroupsPerThread; ++slot) {
+                const float v0 = __shfl(transformed[slot], base, 16);
+                const float v1 = __shfl(transformed[slot], base + stride, 16);
+                const float v2 = __shfl(transformed[slot], base + 2 * stride, 16);
+                const float v3 = __shfl(transformed[slot], base + 3 * stride, 16);
+                transformed[slot] =
+                    h4[digit][0] * v0 + h4[digit][1] * v1 +
+                    h4[digit][2] * v2 + h4[digit][3] * v3;
+            }
+        }
+
+        #pragma unroll
+        for (int slot = 0; slot < kGroupsPerThread; ++slot) {
+            stage[0][t + slot * kThreads] = transformed[slot];
+        }
+        __syncthreads();
+
+        // Radix stage 2 reads FP32 LDS and publishes stage 3's input.  Each
+        // wave accesses one contiguous 32-float span per operand, so no two
+        // lanes address the same 4-byte bank.
+        {
+            constexpr int stride = 16;
+            const int digit = (element / stride) & 3;
+            #pragma unroll
+            for (int slot = 0; slot < kGroupsPerThread; ++slot) {
+                const int group_offset =
+                    (local_group + slot * kGroupsPerSlot) * kGroup;
+                const int base = group_offset + element - digit * stride;
+                const float v0 = stage[0][base];
+                const float v1 = stage[0][base + stride];
+                const float v2 = stage[0][base + 2 * stride];
+                const float v3 = stage[0][base + 3 * stride];
+                transformed[slot] =
+                    h4[digit][0] * v0 + h4[digit][1] * v1 +
+                    h4[digit][2] * v2 + h4[digit][3] * v3;
+                stage[1][t + slot * kThreads] = transformed[slot];
+            }
+        }
+        __syncthreads();
+
+        // Final radix stage only reads stage[1].  The next pass starts by
+        // writing stage[0], so no end-of-pass barrier is needed.
+        {
+            constexpr int stride = 64;
+            const int digit = (element / stride) & 3;
+            #pragma unroll
+            for (int slot = 0; slot < kGroupsPerThread; ++slot) {
+                const int group_offset =
+                    (local_group + slot * kGroupsPerSlot) * kGroup;
+                const int base = group_offset + element - digit * stride;
+                const float v0 = stage[1][base];
+                const float v1 = stage[1][base + stride];
+                const float v2 = stage[1][base + 2 * stride];
+                const float v3 = stage[1][base + 3 * stride];
+                transformed[slot] =
+                    h4[digit][0] * v0 + h4[digit][1] * v1 +
+                    h4[digit][2] * v2 + h4[digit][3] * v3;
+            }
+        }
+
+        #pragma unroll
+        for (int slot = 0; slot < kGroupsPerThread; ++slot) {
+            const int group =
+                group_base + local_group + slot * kGroupsPerSlot;
+            if (active[slot]) {
+                const float stored = round_bf16(transformed[slot] * norm);
+                rowbuf[static_cast<int64_t>(group) * kGroup + element] =
+                    static_cast<__bf16>(stored);
+                local_max = fmaxf(local_max, fabsf(stored));
+            }
+        }
+    }
+    }
+
+    // Row max: reduce within each wave by shuffles, then across the waves
+    // through LDS, with two workgroup barriers in total.
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down(local_max, offset, 32));
+    }
+    if (lane == 0) wave_max[wave] = local_max;
+    __syncthreads();
+    if (wave == 0) {
+        float value = lane < kThreads / 32 ? wave_max[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value = fmaxf(value, __shfl_down(value, offset, 32));
+        }
+        if (lane == 0) wave_max[0] = value;
+    }
+    __syncthreads();
+
+    const float row_max = fmaxf(wave_max[0], 1.0e-10f);
+    const float scale = row_max / 127.0f;
+    const float inverse_scale = 127.0f / row_max;
+    if (t == 0) scaleout[row] = scale;
+
+    // One aligned dword LDS read covers two adjacent BF16
+    // values, avoiding the two-lanes-per-bank mapping of scalar BF16 reads.
+    // Even logical columns are also physically adjacent in the tiled128
+    // layout, so one aligned 16-bit store preserves both output layouts.
+    for (int pair = t; pair < K / 2; pair += kThreads) {
+        const int column = 2 * pair;
+        const convrot_bf16x2 values =
+            *reinterpret_cast<const convrot_bf16x2*>(rowbuf + column);
+        int q0 = static_cast<int>(
+            rintf(static_cast<float>(values[0]) * inverse_scale));
+        int q1 = static_cast<int>(
+            rintf(static_cast<float>(values[1]) * inverse_scale));
+        q0 = q0 < -127 ? -127 : (q0 > 127 ? 127 : q0);
+        q1 = q1 < -127 ? -127 : (q1 > 127 ? 127 : q1);
+        const int64_t qindex = TILED_QOUT
+            ? qout_row_base + static_cast<int64_t>(column >> 7) * 16384 +
+                  (column & 127)
+            : qout_row_base + column;
+        const uint16_t packed =
+            static_cast<uint8_t>(static_cast<int8_t>(q0)) |
+            (static_cast<uint16_t>(
+                 static_cast<uint8_t>(static_cast<int8_t>(q1))) << 8);
+        *reinterpret_cast<uint16_t*>(qout + qindex) = packed;
+    }
+}
+
+inline bool select_convrot_wave32_512(int device) {
+    hipDeviceProp_t properties{};
+    return hipGetDeviceProperties(&properties, device) == hipSuccess &&
+        properties.warpSize == 32 && properties.maxThreadsPerBlock >= 512;
+}
+
+inline bool convrot_wave32_512_supported() {
+    return cached_device_query<select_convrot_wave32_512>();
+}
+
+inline bool convrot_512x2_supported(int K) {
+    if (!convrot_wave32_512_supported()) {
+        return false;
+    }
+    int device = 0;
+    int lds_bytes = 0;
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipDeviceGetAttribute(
+            &lds_bytes, hipDeviceAttributeMaxSharedMemoryPerBlock, device) !=
+            hipSuccess) {
+        return false;
+    }
+    constexpr size_t kStaticBytes =
+        (2 * 512 * 2 + 512 / 32) * sizeof(float);
+    return static_cast<size_t>(K) * sizeof(__bf16) + kStaticBytes <=
+        static_cast<size_t>(lds_bytes);
+}
+
 template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS>
 inline void launch_convrot_quant_impl(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout,
+    ConvrotInput input, int in_dtype, int8_t* qout, float* scaleout,
     int M, int K, int group_size, hipStream_t stream) {
 
     const size_t shmem = static_cast<size_t>(K) * convrot_row_element_size(in_dtype);
     convrot_quant_kernel<RowT, PACK_INT4, ACT, BLOCK_THREADS><<<M, BLOCK_THREADS, shmem, stream>>>(
-        x, in_dtype, qout, scaleout, M, K, group_size);
+        input, in_dtype, qout, scaleout, M, K, group_size);
 }
 
 template <bool PACK_INT4, int ACT, int BLOCK_THREADS>
 struct LaunchConvrotQuantLegacyForBlock {
-    const void* x;
+    ConvrotInput input;
     int in_dtype;
     int8_t* qout;
     float* scaleout;
@@ -841,25 +1508,26 @@ struct LaunchConvrotQuantLegacyForBlock {
     template <typename RowT>
     void operator()() const {
         launch_convrot_quant_impl<RowT, PACK_INT4, ACT, BLOCK_THREADS>(
-            x, in_dtype, qout, scaleout, M, K, group_size, stream);
+            input, in_dtype, qout, scaleout, M, K, group_size, stream);
     }
 };
 
 template <bool PACK_INT4, int ACT, int BLOCK_THREADS>
 inline void launch_convrot_quant_for_block(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout,
+    ConvrotInput input, int in_dtype, int8_t* qout, float* scaleout,
     int M, int K, int group_size, hipStream_t stream) {
     dispatch_convrot_row_type(
         in_dtype,
         LaunchConvrotQuantLegacyForBlock<PACK_INT4, ACT, BLOCK_THREADS>{
-            x, in_dtype, qout, scaleout, M, K, group_size, stream});
+            input, in_dtype, qout, scaleout, M, K, group_size, stream});
 }
 
 template <bool PACK_INT4, int ACT = kActNone>
 inline void launch_convrot_quant(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout,
+    ConvrotInput input, int in_dtype, int8_t* qout, float* scaleout,
     int M, int K, int group_size, hipStream_t stream,
-    void* spill_rotated = nullptr, void* spill_partials = nullptr) {
+    void* spill_rotated = nullptr, void* spill_partials = nullptr,
+    bool tiled_output = false) {
 
     // INT8 G=256: fused when (M, K) fits in LDS, else caller-owned global spill.
     if (!PACK_INT4 && group_size == 256) {
@@ -869,7 +1537,8 @@ inline void launch_convrot_quant(
             dispatch_convrot_row_type(
                 in_dtype,
                 LaunchConvrotQuantFusedForRow<ACT>{
-                    x, in_dtype, qout, scaleout, M, K, nullptr, 0.0f, stream, block_threads,
+                    input, in_dtype, qout, scaleout, M, K, nullptr, 0.0f, tiled_output,
+                    stream, block_threads,
                     &launched});
             if (launched) {
                 return;
@@ -880,7 +1549,8 @@ inline void launch_convrot_quant(
                 "convrot global spill requires caller-provided workspace buffers");
         }
         launch_convrot_quant_global_managed<ACT>(
-            x, in_dtype, qout, scaleout, M, K, stream, spill_rotated, spill_partials);
+            input, in_dtype, qout, scaleout, M, K, stream, spill_rotated, spill_partials,
+            tiled_output);
         return;
     }
 
@@ -890,10 +1560,10 @@ inline void launch_convrot_quant(
     const int block_threads = (group_size == 256 && K >= 512) ? 1024 : 256;
     if (block_threads == 1024) {
         launch_convrot_quant_for_block<PACK_INT4, ACT, 1024>(
-            x, in_dtype, qout, scaleout, M, K, group_size, stream);
+            input, in_dtype, qout, scaleout, M, K, group_size, stream);
     } else {
         launch_convrot_quant_for_block<PACK_INT4, ACT, 256>(
-            x, in_dtype, qout, scaleout, M, K, group_size, stream);
+            input, in_dtype, qout, scaleout, M, K, group_size, stream);
     }
 }
 
@@ -902,7 +1572,7 @@ inline void launch_convrot_quant(
 // that kernel will not run.
 inline void launch_convrot_quant_rms_norm(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
-    const void* act_weight, float act_eps, hipStream_t stream) {
+    const void* act_weight, float act_eps, int act_weight_code, hipStream_t stream) {
     if (act_weight == nullptr) {
         throw std::runtime_error("convrot: rms_norm activation requires a weight");
     }
@@ -912,8 +1582,10 @@ inline void launch_convrot_quant_rms_norm(
         dispatch_convrot_row_type(
             in_dtype,
             LaunchConvrotQuantFusedForRow<kActRmsNorm>{
-                x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, block_threads,
-                &launched});
+                ConvrotInput{x, nullptr, K, 0}, in_dtype, qout, scaleout, M, K,
+                act_weight, act_eps, false, stream,
+                block_threads,
+                &launched, act_weight_code});
     }
     if (!launched) {
         throw std::runtime_error("convrot: rms_norm activation needs the fused G=256 kernel");

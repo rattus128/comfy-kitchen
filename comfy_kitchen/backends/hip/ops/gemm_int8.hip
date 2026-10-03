@@ -100,3 +100,59 @@ extern "C" void launch_int8_gemm_kernel(
         throw std::runtime_error("int8_gemm: unsupported output dtype");
     }
 }
+
+template <typename OutT, typename Epi>
+static void launch_int8_tiled128(
+    const uint8_t* A, const uint8_t* B, OutT* C,
+    int M, int N, int K, int ldc, Epi epi, hipStream_t stream) {
+    using namespace comfy::hip_backend;
+    constexpr int BM = 128, BN = 128, BKB = 128;
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    gemm_wmma_kernel<MmaInt8, Epi, OutT, BM, BN, BKB,
+                     4, 2, 2, 4, const uint8_t*, true, true>
+        <<<grid, 256, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+}
+
+extern "C" void launch_int8_gemm_tiled128_kernel(
+    const void* a, const void* b, void* c,
+    const void* scale_a, const void* scale_b, int scale_b_stride,
+    const void* bias, int bias_code,
+    int M, int N, int K, int ldc, int out_code, hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+    if (M == 0) return;
+    if (N <= 0 || K <= 0 || N % 128 != 0 || K % 128 != 0 || ldc < N) {
+        throw std::runtime_error(
+            "tiled-A int8 GEMM: requires positive N/K divisible by "
+            "128 and ldc>=N");
+    }
+    EpiRowwise epi{
+        static_cast<const float*>(scale_a), static_cast<const float*>(scale_b),
+        scale_b_stride, bias, bias_code};
+    const uint8_t* A = static_cast<const uint8_t*>(a);
+    const uint8_t* B = static_cast<const uint8_t*>(b);
+    if (out_code == kBF16) {
+        if (epi.bias == nullptr && epi.scale_b_stride == 1) {
+            // One ordinary 128x256 tile shares A across four N waves. No
+            // projection boundaries or paired weights are involved.
+            constexpr int BM = 128, BN = 256, BK = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<MmaInt8, EpiRowwise, __bf16,
+                             BM, BN, BK, 4, 4, 2, 4,
+                             const uint8_t*, true, true, 8>
+                <<<grid, 512, 0, stream>>>(
+                    A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi);
+        } else {
+            launch_int8_tiled128(
+                A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, stream);
+        }
+    } else if (out_code == kF16) {
+        launch_int8_tiled128(
+            A, B, static_cast<__half*>(c), M, N, K, ldc, epi, stream);
+    } else if (out_code == kF32) {
+        launch_int8_tiled128(
+            A, B, static_cast<float*>(c), M, N, K, ldc, epi, stream);
+    } else {
+        throw std::runtime_error("tiled-A int8 GEMM: unsupported output dtype");
+    }
+}

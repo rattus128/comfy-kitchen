@@ -32,6 +32,7 @@ from comfy_kitchen.backends._activations import apply_input_act as _apply_input_
 from comfy_kitchen.backends._activations import apply_residual as _apply_residual
 from comfy_kitchen.backends._activations import input_act_code as _input_act_code
 from comfy_kitchen.backends._activations import input_act_width as _input_act_width
+from comfy_kitchen.backends._activations import validate_input_act_up
 from comfy_kitchen.backends.eager import rope as _eager_rope
 from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE, DTYPE_TO_CODE
 from comfy_kitchen.backends.eager.sol_attn import (
@@ -64,6 +65,7 @@ __all__ = [
     "fp16_conv3d_out",
     "fp16_linear",
     "gemv_awq_w4a16",
+    "rms_gated_residual",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "quantize_svdquant_w4a4",
@@ -184,6 +186,12 @@ _ARCH_WMMA_GFX11 = frozenset(_ARCH_GROUPS["wmma_gfx11"])
 _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
 _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
+
+
+def _has_nonduplicated_wmma(device: torch.device | int | None = None) -> bool:
+    """Whether WMMA operands use the gfx12 128-bit layout."""
+    return _gfx_arch(device) in _ARCH_WMMA_GFX12
+
 
 # The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
 # or a scalar reduction and runs on any supported architecture. This set names the
@@ -539,6 +547,19 @@ def dequantize_int8_convrot_weight_dtype(
 # Keyed by device and dtype: convrot_max_k() reports the LDS budget of whichever
 # device is current and FP32 rows consume twice the LDS of FP16/BF16 rows.
 _convrot_max_k: dict[tuple[int, torch.dtype], int] = {}
+_CONVROT_SPILL_WORKSPACE_BYTES = 32 << 20
+
+
+def _convrot_row_max_k(device: torch.device, dtype: torch.dtype) -> int:
+    """The widest row ``device``'s LDS can stage in ``dtype``, cached per device."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (index, dtype)
+    max_k = _convrot_max_k.get(key)
+    if max_k is None:
+        with torch.cuda.device(index):
+            max_k = _C.convrot_max_k(DTYPE_TO_CODE[dtype])
+        _convrot_max_k[key] = max_k
+    return max_k
 
 
 def _convrot_supported(
@@ -559,49 +580,97 @@ def _convrot_supported(
         return False
     if group_size == 256 and int8_global_spill:
         return True
-
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, dtype)
-    max_k = _convrot_max_k.get(key)
-    if max_k is None:
-        with torch.cuda.device(index):
-            max_k = _C.convrot_max_k(DTYPE_TO_CODE[dtype])
-        _convrot_max_k[key] = max_k
+    max_k = _convrot_row_max_k(device, dtype)
     return max_k > 0 and k <= max_k
 
 
 def _rotate_quant_int8(
     x2d: torch.Tensor, group_size: int, input_act: str | None = None,
     act_weight: torch.Tensor | None = None, act_eps: float = 0.0,
+    *, tiled_output: bool = False, act_scale: torch.Tensor | None = None,
+    act_shift: torch.Tensor | None = None, act_up: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     m, k_in = x2d.shape
     # swiglu halves the row: the [gate | up] input is twice the quantized width.
-    k = k_in // _input_act_width(input_act)
-    q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
+    k = k_in if act_up is not None else k_in // _input_act_width(input_act)
+    q_rows = (m + 127) // 128 * 128 if tiled_output else m
+    q = torch.empty((q_rows, k), dtype=torch.int8, device=x2d.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
-    x_arg = _operand(x2d, x2d.device, "x2d")
-    spill_rotated = None
-    spill_partials = None
+    x_arg = x2d if act_up is not None else _operand(x2d, x2d.device, "x2d")
     # check_convrot_k queries the current device's LDS budget, so pin it to the
     # operand's device rather than trusting the caller thread's current device.
     with torch.cuda.device(x2d.device):
-        if group_size == 256 and _C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x2d.dtype]):
-            spill_rotated = torch.empty((m, k), dtype=x2d.dtype, device=x2d.device)
-            spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x2d.device)
-        _C.quantize_int8_convrot(
-            _dl(x_arg),
-            _dl(q),
-            _dl(scales),
-            None if spill_rotated is None else _dl(spill_rotated),
-            None if spill_partials is None else _dl(spill_partials),
-            m,
-            k,
-            group_size,
-            _input_act_code(input_act),
-            _stream(x2d),
-            None if act_weight is None else _dl(act_weight),
-            float(act_eps),
+        if group_size != 256 or not _C.convrot_int8_needs_spill(
+            m, k, DTYPE_TO_CODE[x2d.dtype]
+        ):
+            _C.quantize_int8_convrot(
+                _dl(x_arg), _dl(q), _dl(scales),
+                None, None, m, k,
+                group_size, _input_act_code(input_act), _stream(x2d),
+                None if act_weight is None else _dl(act_weight),
+                float(act_eps), tiled_output,
+                None if act_scale is None else _dl(act_scale),
+                None if act_shift is None else _dl(act_shift),
+                None if act_up is None else _dl(act_up),
+            )
+            return q, scales
+
+        workspace_per_row = x_arg.element_size() * k + 4 * (k // 256)
+        row_cap = max(1, _CONVROT_SPILL_WORKSPACE_BYTES // workspace_per_row)
+        capacity_chunk_count = (m + row_cap - 1) // row_cap
+        # For wide rows the native policy picks the global implementation at
+        # 96 rows or more; a shorter chunk would switch to the one-wave LDS
+        # schedule. Balance the chunks so none drops below that threshold and
+        # every row of one call runs the same kernel. Keep the capacity-safe
+        # count when rebalancing would exceed the workspace cap.
+        balanced_chunk_count = min(capacity_chunk_count, max(1, m // 96))
+        balanced_chunk_rows = (
+            m + balanced_chunk_count - 1
+        ) // balanced_chunk_count
+        chunk_count = (
+            balanced_chunk_count
+            if balanced_chunk_rows <= row_cap
+            else capacity_chunk_count
         )
+        if tiled_output:
+            # A tile-major output slice must start on a complete 128-row tile.
+            # Bound the scratch space as for row-major output, with one tile
+            # as the minimum working set.
+            chunk_rows = max(128, row_cap // 128 * 128)
+            rows_per_chunk = [min(chunk_rows, m - start) for start in range(0, m, chunk_rows)]
+        else:
+            rows_per_chunk = [m // chunk_count + (chunk < m % chunk_count) for chunk in range(chunk_count)]
+        chunk_rows = max(rows_per_chunk)
+        spill_rotated = torch.empty(
+            (chunk_rows, k), dtype=x_arg.dtype, device=x2d.device
+        )
+        spill_partials = torch.empty(
+            (chunk_rows, k // 256), dtype=torch.float32, device=x2d.device
+        )
+        start = 0
+        for rows in rows_per_chunk:
+            end = start + rows
+            q_end = (end + 127) // 128 * 128 if tiled_output else end
+            _C.quantize_int8_convrot(
+                # Row slices of x and q start on a 256-byte multiple (K % 256 == 0);
+                # the kernel writes scales[row] as scalars, so the scales slice needs
+                # no alignment. Output slices must be passed as views, never copied.
+                _dl(x_arg[start:end]),
+                _dl(q[start:q_end]),
+                _dl(scales[start:end]),
+                _dl(spill_rotated),
+                _dl(spill_partials),
+                rows,
+                k,
+                group_size,
+                _input_act_code(input_act),
+                _stream(x2d),
+                None if act_weight is None else _dl(act_weight),
+                float(act_eps),
+                tiled_output, None, None,
+                None if act_up is None else _dl(act_up[start:end]),
+            )
+            start = end
     return q, scales
 
 
@@ -616,6 +685,23 @@ def _fused_rms_norm_ok(x: torch.Tensor, convrot: bool, group_size: int) -> bool:
     # the spill answer reads the current device's LDS budget, as in _rotate_quant_int8
     with torch.cuda.device(x.device):
         return not _C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x.dtype])
+
+
+def _norm_convrot_quant_int8(
+    x2d: torch.Tensor, weight: torch.Tensor | None, scale: torch.Tensor | None,
+    shift: torch.Tensor | None, eps: float, norm_kind: int, *, tiled_output: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = x2d.shape
+    q_rows = (m + 127) // 128 * 128 if tiled_output else m
+    q = torch.empty((q_rows, k), dtype=torch.int8, device=x2d.device)
+    scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
+    _C.norm_convrot_quant(
+        _dl(_operand(x2d, x2d.device, "x")),
+        None if weight is None else _dl(_operand(weight.reshape(-1), x2d.device, "weight")),
+        None if scale is None else _dl(_operand(scale.reshape(-1), x2d.device, "scale")),
+        None if shift is None else _dl(_operand(shift.reshape(-1), x2d.device, "shift")),
+        _dl(q), _dl(scales), m, k, float(eps), norm_kind, tiled_output, _stream(x2d))
+    return q, scales
 
 
 def quantize_and_rotate_rowwise(
@@ -746,25 +832,79 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    input_act_scale: torch.Tensor | None = None,
+    input_act_shift: torch.Tensor | None = None,
+    input_act_up: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
-    # Rejected here so every route fails the same way, not just the fused one.
-    _input_act_code(input_act)
+    validate_input_act_up(x, input_act, input_act_up)
+    k_raw = x.shape[-1]
+    shared_modulation = all(value is None or (
+        value.device == x.device and 0 < value.ndim <= x.ndim and value.numel() == k_raw
+        and value.shape[-1] == k_raw and value.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    ) for value in (input_act_scale, input_act_shift))
+    native_norm_kind = None
+    if (
+        input_act in ("rms_norm", "adaln")
+        and convrot and convrot_groupsize == 256 and x.dtype == torch.bfloat16
+        # Other widths retain their original producer: compiler reassociation
+        # in its unrolled tail can change INT8 rounding ties.
+        and k_raw in (4096, 6144) and shared_modulation
+        and _has_nonduplicated_wmma(x.device)
+    ):
+        if (input_act == "rms_norm" and input_act_weight is not None
+                and input_act_weight.device == x.device
+                and input_act_weight.dtype == torch.float32
+                and input_act_weight.numel() == k_raw
+                and all(value is None or value.dtype == x.dtype for value in (input_act_scale, input_act_shift))):
+            native_norm_kind = 0
+        elif input_act == "adaln":
+            native_norm_kind = 1
+
+    if native_norm_kind is None and input_act == "adaln":
+        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps,
+                             input_act_scale, input_act_shift, input_act_up)
+        input_act = None
+        input_act_up = None
+        input_act_weight = input_act_scale = input_act_shift = None
+    if native_norm_kind is None:
+        _input_act_code(input_act)
+    if (input_act_scale is not None or input_act_shift is not None) and input_act not in ("rms_norm", "adaln"):
+        raise ValueError("input modulation requires input_act 'rms_norm' or 'adaln'")
     act_weight = None
-    if input_act == "rms_norm":
+    act_scale = None
+    act_shift = None
+    packed_rms = (
+        input_act == "rms_norm" and convrot and convrot_groupsize == 256
+        and x.dtype == torch.bfloat16 and x.shape[-1] in (3840, 10240)
+        and _has_nonduplicated_wmma(x.device)
+    )
+    if input_act == "rms_norm" and native_norm_kind is None:
         if input_act_weight is None:
             raise ValueError("input_act 'rms_norm' requires act_weight")
+        modulation_fusable = all(value is None or (
+            packed_rms and value.dtype == x.dtype and value.device == x.device
+            and 0 < value.ndim <= x.ndim
+            and value.shape[-1] == x.shape[-1]
+            and value.numel() == x.shape[-1]
+        ) for value in (input_act_scale, input_act_shift)
+        )
         if (
             input_act_weight.numel() == x.shape[-1]
+            and modulation_fusable
             and _fused_rms_norm_ok(x, convrot, convrot_groupsize)
         ):
             act_weight = _operand(
-                input_act_weight.reshape(-1).to(dtype=x.dtype), x.device, "input_act_weight")
-    if input_act not in _HIP_FUSED_ACTS and act_weight is None:
-        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+                input_act_weight.reshape(-1), x.device, "input_act_weight")
+            if input_act_scale is not None:
+                act_scale = _operand(input_act_scale.reshape(-1), x.device, "input_act_scale")
+            if input_act_shift is not None:
+                act_shift = _operand(input_act_shift.reshape(-1), x.device, "input_act_shift")
+    if native_norm_kind is None and input_act not in _HIP_FUSED_ACTS and act_weight is None:
+        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps, input_act_scale, input_act_shift)
         input_act = None
     # k_act is the activated (quantized) row width: swiglu halves the raw row.
-    k_act = x.shape[-1] // _input_act_width(input_act)
+    k_act = x.shape[-1] if input_act_up is not None else x.shape[-1] // _input_act_width(input_act)
     if k_act != weight.shape[-1]:
         raise ValueError(
             f"Input and weight inner dimensions must match, got {k_act} and {weight.shape[-1]}"
@@ -778,7 +918,18 @@ def int8_linear(
         )
 
     orig_shape = x.shape
-    x2d = x.reshape(-1, orig_shape[-1]).contiguous()
+    x2d = x.reshape(-1, orig_shape[-1])
+    up2d = None
+    if input_act_up is None:
+        x2d = x2d.contiguous()
+    else:
+        up2d = input_act_up.reshape(-1, k_act)
+        # Preserve row-strided views of a packed projection. Unusual layouts
+        # can copy each operand independently; they never need concatenation.
+        if x2d.stride(-1) != 1 or x2d.stride(0) <= 0 or x2d.data_ptr() % 8:
+            x2d = x2d.clone(memory_format=torch.contiguous_format)
+        if up2d.stride(-1) != 1 or up2d.stride(0) <= 0 or up2d.data_ptr() % 8:
+            up2d = up2d.clone(memory_format=torch.contiguous_format)
     m = x2d.shape[0]
     k = k_act
     n = weight.shape[0]
@@ -800,12 +951,21 @@ def int8_linear(
             return _eager.int8_linear(
                 x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
                 input_act=input_act, residual=residual, residual_scale=residual_scale,
+                input_act_weight=input_act_weight, input_act_eps=input_act_eps,
+                input_act_scale=input_act_scale, input_act_shift=input_act_shift,
+                input_act_up=input_act_up,
             )
-        # The only route that absorbs the activation; the rest apply it eagerly.
-        q, x_scale = _rotate_quant_int8(
-            x2d, convrot_groupsize, input_act, act_weight, input_act_eps)
+        if native_norm_kind is not None:
+            q, x_scale = _norm_convrot_quant_int8(
+                x2d, input_act_weight if native_norm_kind == 0 else None,
+                input_act_scale, input_act_shift, input_act_eps, native_norm_kind)
+        else:
+            q, x_scale = _rotate_quant_int8(
+                x2d, convrot_groupsize, input_act, act_weight, input_act_eps,
+                act_scale=act_scale, act_shift=act_shift,
+                act_up=up2d)
     else:
-        x2d = _apply_input_act(x2d, input_act)
+        x2d = _apply_input_act(x2d, input_act, act_up=up2d).contiguous()
         q = torch.empty((m, k), dtype=torch.int8, device=x.device)
         x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
         _C.quantize_int8_rowwise(_dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x))
@@ -816,10 +976,10 @@ def int8_linear(
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     _C.int8_gemm(
-        _dl(q), _dl(weight), _dl(out),
-        _dl(x_scale), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+        0 if weight_scale.numel() == 1 else 1,
+        None if bias is None else _dl(bias), m, n, k,
+        DTYPE_TO_CODE[out_dtype], _stream(x),
     )
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
@@ -827,10 +987,57 @@ def int8_linear(
     return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
 
 
+def rms_gated_residual(
+    activation: torch.Tensor,
+    norm_weight: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1.0e-5,
+) -> torch.Tensor:
+    """Exact BF16 RMSNorm, gate multiplication, and residual add."""
+    width = activation.shape[-1] if activation.ndim else 0
+    max_k = 0
+    if activation.dtype == torch.bfloat16 and activation.device.type == "cuda":
+        max_k = _convrot_row_max_k(activation.device, activation.dtype)
+    use_fused = (
+        activation.dtype == torch.bfloat16
+        and norm_weight.dtype == torch.bfloat16
+        and residual.dtype == torch.bfloat16
+        and gate.dtype == torch.bfloat16
+        and activation.device == norm_weight.device == residual.device == gate.device
+        and activation.ndim >= 2
+        and activation.shape == residual.shape
+        and width > 0
+        and width % 4 == 0
+        and width <= max_k
+        and norm_weight.shape == (width,)
+        and 0 < gate.ndim <= activation.ndim
+        and gate.numel() == width
+        and gate.shape[-1] == width
+    )
+    if not use_fused:
+        return _eager.rms_gated_residual(
+            activation, norm_weight, residual, gate, eps
+        )
+
+    shape = activation.shape
+    activation_2d = activation.reshape(-1, width).contiguous()
+    norm_weight_1d = norm_weight.reshape(-1).contiguous()
+    residual_2d = residual.reshape(-1, width).contiguous()
+    gate_1d = gate.reshape(-1).contiguous()
+    output = torch.empty_like(activation_2d)
+    _C.rms_gated_residual_bf16(
+        _dl(_aligned(activation_2d)), _dl(_aligned(norm_weight_1d)),
+        _dl(_aligned(residual_2d)), _dl(_aligned(gate_1d)), _dl(output),
+        activation_2d.shape[0], width,
+        float(eps), _stream(activation),
+    )
+    return output.reshape(shape)
+
+
 # ---------------------------------------------------------------------------
 # Grouped W4A8 over the INT8 GEMM
 # ---------------------------------------------------------------------------
-
 def _dequant_int4_grouped_to_int8(
     qdata: torch.Tensor,
     s_rel: torch.Tensor,
@@ -2455,6 +2662,8 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 return ValidationResult.fail("q", "grid dims exceed HIP limits")
         return ValidationResult.ok()
 
+    bf16_param = ParamConstraint(dtypes=frozenset({torch.bfloat16}))
+
     constraints = {
         "sol_attn": FunctionConstraints(
             params={
@@ -2552,6 +2761,11 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             },
             default_devices=dev,
         ),
+        "rms_gated_residual": FunctionConstraints(params={
+            "activation": bf16_param, "norm_weight": bf16_param,
+            "residual": bf16_param, "gate": bf16_param,
+            "eps": ParamConstraint(dtypes=frozenset({float})),
+        }, default_devices=dev),
         "quantize_w4a8_int8_weight": FunctionConstraints(
             params={
                 "weight": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),

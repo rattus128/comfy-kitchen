@@ -38,6 +38,7 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "rms_adaln",
+    "rms_gated_residual",
     "apply_rope",
     "apply_rope_",
     "apply_rope1",
@@ -169,6 +170,7 @@ from comfy_kitchen.backends._activations import (  # noqa: E402
 from comfy_kitchen.backends._activations import (  # noqa: E402
     input_act_width as _input_act_width,
 )
+from comfy_kitchen.backends._activations import validate_input_act_up  # noqa: E402
 from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E402
 from comfy_kitchen.backends.eager import rope as _eager_rope  # noqa: E402
 from comfy_kitchen.backends.eager.group_norm_pad3d import (  # noqa: E402
@@ -177,6 +179,9 @@ from comfy_kitchen.backends.eager.group_norm_pad3d import (  # noqa: E402
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     DTYPE_CODE_TO_DTYPE,
     DTYPE_TO_CODE,
+)
+from comfy_kitchen.backends.eager.residual import (  # noqa: E402
+    rms_gated_residual as eager_rms_gated_residual,
 )
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     dequantize_int8_simple as eager_dequantize_int8_simple,
@@ -1556,6 +1561,8 @@ def quantize_int8_rowwise_convrot64(
         _input_act_code(input_act),
         int(stochastic_rounding or 0),
         _wrap_for_dlpack(act_weight_arg),
+        _wrap_for_dlpack(_empty_cuda_tensor(weight_2d.device, weight_2d.dtype)),
+        _wrap_for_dlpack(_empty_cuda_tensor(weight_2d.device, weight_2d.dtype)),
         float(input_act_eps),
         stream_ptr,
     )
@@ -1967,8 +1974,49 @@ def _act_weight_arg(input_act, input_act_weight, device, dtype: torch.dtype) -> 
     """The fused quantizer's act-weight operand: the norm weight for acts
     that carry one, the empty placeholder otherwise."""
     if input_act == "rms_norm" and input_act_weight is not None:
-        return input_act_weight.to(device=device, dtype=dtype).contiguous()
+        return input_act_weight.to(device=device).contiguous()
     return _empty_cuda_tensor(device, dtype)
+
+
+def rms_gated_residual(
+    activation: torch.Tensor,
+    norm_weight: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1.0e-5,
+) -> torch.Tensor:
+    """BF16 RMSNorm followed by independently rounded gate and residual ops."""
+    width = activation.shape[-1] if activation.ndim else 0
+    use_fused = (
+        _EXT_AVAILABLE
+        and activation.device.type == "cuda"
+        and activation.dtype == norm_weight.dtype == residual.dtype == gate.dtype == torch.bfloat16
+        and activation.device == norm_weight.device == residual.device == gate.device
+        and activation.ndim >= 2
+        and activation.shape == residual.shape
+        and width > 0
+        and width % 4 == 0
+        and norm_weight.shape == (width,)
+        and 0 < gate.ndim <= activation.ndim
+        and gate.numel() == width
+        and gate.shape[-1] == width
+    )
+    if not use_fused:
+        return eager_rms_gated_residual(activation, norm_weight, residual, gate, eps)
+
+    shape = activation.shape
+    activation_2d = activation.reshape(-1, width).contiguous()
+    norm_weight_1d = norm_weight.reshape(-1).contiguous()
+    residual_2d = residual.reshape(-1, width).contiguous()
+    gate_1d = gate.reshape(-1).contiguous()
+    output = torch.empty_like(activation_2d)
+    _C.rms_gated_residual_bf16(
+        _wrap_for_dlpack(activation_2d), _wrap_for_dlpack(norm_weight_1d),
+        _wrap_for_dlpack(residual_2d), _wrap_for_dlpack(gate_1d),
+        _wrap_for_dlpack(output), activation_2d.shape[0], width, float(eps),
+        torch.cuda.current_stream(activation.device).cuda_stream,
+    )
+    return output.reshape(shape)
 
 
 def int8_linear(
@@ -1984,19 +2032,40 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    input_act_scale: torch.Tensor | None = None,
+    input_act_shift: torch.Tensor | None = None,
+    input_act_up: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if residual is not None and residual_scale is None:
         raise ValueError("int8_linear: residual requires residual_scale")
+    validate_input_act_up(x, input_act, input_act_up)
+    if input_act == "adaln":
+        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps,
+                             input_act_scale, input_act_shift, act_up=input_act_up)
+        input_act = None
+        input_act_up = None
+        input_act_weight = input_act_scale = input_act_shift = None
+    if (input_act_scale is not None or input_act_shift is not None) and input_act != "rms_norm":
+        raise ValueError("input modulation requires input_act 'rms_norm' or 'adaln'")
     orig_shape = x.shape
-    x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
+    x_2d = x.reshape(-1, x.shape[-1])
+    up_row_view = None
+    if input_act_up is None:
+        x_2d = x_2d.contiguous()
+    else:
+        up_row_view = input_act_up.reshape(-1, input_act_up.shape[-1])
+        if x_2d.stride(-1) != 1:
+            x_2d = x_2d.contiguous()
+        if up_row_view.stride(-1) != 1:
+            up_row_view = up_row_view.contiguous()
     if not weight.is_contiguous():
         weight = weight.contiguous()
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
     # Only the fused ConvRot quantizer can absorb the activation; every other
-    # route applies it eagerly here and proceeds unchanged, so all paths agree.
+    # route applies it eagerly, retaining its tensor-storage rounding.
     # k_act is the activated (quantized) row width: swiglu halves the raw row.
-    k_act = x_2d.shape[-1] // _input_act_width(input_act)
+    k_act = x_2d.shape[-1] if input_act_up is not None else x_2d.shape[-1] // _input_act_width(input_act)
     _fused_convrot_ok = (
         convrot
         and convrot_groupsize == 256
@@ -2004,9 +2073,27 @@ def int8_linear(
         and 256 <= k_act <= _CONVROT_FUSED_MAX_K
         and _convrot_fused_shared_memory_fits(x_2d, k_act, convrot_groupsize)
     )
+    modulation = (input_act_scale, input_act_shift)
+    modulation_fusable = all(
+        value is None or (
+            value.device == x_2d.device
+            and value.dtype == x_2d.dtype
+            and 0 < value.ndim <= x.ndim
+            and value.numel() == k_act
+            and value.shape[-1] == k_act
+        )
+        for value in modulation
+    )
+    _fused_convrot_ok = _fused_convrot_ok and modulation_fusable
     if input_act not in (None, "none") and not _fused_convrot_ok:
-        x_2d = _apply_input_act(x_2d, input_act, input_act_weight, input_act_eps)
+        x_2d = _apply_input_act(
+            x, input_act, input_act_weight, input_act_eps, input_act_scale,
+            input_act_shift, act_up=input_act_up)
+        x_2d = x_2d.reshape(-1, k_act).contiguous()
         input_act = None
+        input_act_up = None
+        up_row_view = None
+        input_act_weight = input_act_scale = input_act_shift = None
 
     m = x_2d.shape[0]
     k = k_act
@@ -2074,6 +2161,12 @@ def int8_linear(
             x_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
             act_weight_arg = _act_weight_arg(
                 input_act, input_act_weight, x.device, x_2d.dtype)
+            act_scale_arg = (
+                input_act_scale.reshape(-1).contiguous() if input_act_scale is not None
+                else _empty_cuda_tensor(x.device, x_2d.dtype))
+            act_shift_arg = (
+                input_act_shift.reshape(-1).contiguous() if input_act_shift is not None
+                else _empty_cuda_tensor(x.device, x_2d.dtype))
             _C.quantize_int8_rowwise_convrot64(
                 _wrap_for_dlpack(x_2d),
                 _wrap_for_dlpack(x_qdata),
@@ -2083,8 +2176,11 @@ def int8_linear(
                 _input_act_code(input_act),
                 0,
                 _wrap_for_dlpack(act_weight_arg),
+                _wrap_for_dlpack(act_scale_arg),
+                _wrap_for_dlpack(act_shift_arg),
                 float(input_act_eps),
                 stream_ptr,
+                None if up_row_view is None else _wrap_for_dlpack(up_row_view),
             )
         elif _should_use_convrot_fused_kernel(x_2d, k, convrot_groupsize):
             # Fused single-kernel rotation + row-wise quant (no bf16 HBM round-trip).
@@ -3762,6 +3858,12 @@ def _build_constraints() -> dict:
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
+        "rms_gated_residual": FunctionConstraints(
+            params={name: ParamConstraint(dtypes=frozenset({torch.bfloat16}))
+                    for name in ("activation", "norm_weight", "residual", "gate")},
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        ),
         "sol_attn": FunctionConstraints(
             params={
                 "q": ParamConstraint(
@@ -4490,4 +4592,3 @@ def _register():
 
 
 _register()
-

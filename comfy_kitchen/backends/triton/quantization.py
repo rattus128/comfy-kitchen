@@ -1030,6 +1030,9 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    input_act_scale: torch.Tensor | None = None,
+    input_act_shift: torch.Tensor | None = None,
+    input_act_up: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer using fused Triton kernel.
 
@@ -1053,7 +1056,7 @@ def int8_linear(
     Returns:
         Result tensor [..., N].
     """
-    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps, input_act_scale, input_act_shift, input_act_up)
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
 
