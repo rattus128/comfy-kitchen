@@ -21,8 +21,11 @@ namespace {
 // third on a 0.96 TB/s one. A per-issuer pace derived from the device's memory
 // clock and bus width keeps the burst at kIssueRateFraction of the bus; the
 // hardware already throttles the issuers below that while demand traffic runs.
+// Qwen3.5-9B W6A8 decode, 55 MiB ring on the 5080: 88-92% of the bus is 5% faster
+// than unpaced, 96-100% gives nothing, 75-80% starts skipping; the 5090 is flat
+// from 75% to 100% (+2.6% over unpaced).
 constexpr int kIssuers = PREFETCH_RING_ISSUERS;
-constexpr double kIssueRateFraction = 0.75;
+constexpr double kIssueRateFraction = 0.90;
 #ifndef PREFETCH_RING_ISSUER_CARVEOUT
 #define PREFETCH_RING_ISSUER_CARVEOUT cudaSharedmemCarveoutMaxShared
 #endif
