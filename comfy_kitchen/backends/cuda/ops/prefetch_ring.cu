@@ -28,6 +28,7 @@ constexpr double kIssueRateFraction = 0.75;
 #endif
 constexpr int kIssuerThreads = 32;
 constexpr int kIssueBatch = 8;   // chunks issued per consumed-snapshot
+constexpr int kPaceCreditChunks = 2;   // paced issuer may owe at most this many chunks after an oversleep
 PrefetchRingState* g_states[16] = {};
 bool g_unsupported[16] = {};   // pre-sm_90: no bulk prefetch, consumers keep ring == nullptr
 cudaStream_t g_issue_streams[16] = {};
@@ -283,14 +284,17 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
         trace_record(ring, trace, trace_cap, consumed, cursor, PREFETCH_RING_TRACE_ISSUE);
         for (int k = 0; k < kIssueBatch && cursor < cap; ++k) {
             if (pace_ns != 0) {
-                // No credit accumulates while the window was exhausted: a burst into an
-                // idle bus starts at once and then holds the paced rate.
+                // Token bucket: __nanosleep rounds up to ~1.1 us, so the schedule advances
+                // by pace_ns per chunk and an oversleep is repaid by the next chunks going
+                // out at once. Credit is capped at kPaceCreditChunks so a long credit wait
+                // cannot turn into a burst.
                 uint64_t now = global_timer();
+                if (next_issue + kPaceCreditChunks * pace_ns < now) next_issue = now - kPaceCreditChunks * pace_ns;
                 while (now < next_issue) {
                     __nanosleep(next_issue - now < 1000 ? static_cast<unsigned>(next_issue - now) : 1000u);
                     now = global_timer();
                 }
-                next_issue = now + pace_ns;
+                next_issue += pace_ns;
             }
             pos.prefetch(chunk);
             touched += chunk;
