@@ -86,6 +86,7 @@ __all__ = [
     "dequantize_w4a8_int8_weight",
     "has_wmma",
     "int8_linear",
+    "int8_linear_tiled_weight",
     "int8_attention_is_available",
     "flash_attention_decode_is_available",
     "flash_attention_decode_gqa_is_available",
@@ -211,6 +212,7 @@ _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d_out",
     "fp16_linear",
     "int8_linear",
+    "int8_linear_tiled_weight",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
     "na3d",
@@ -899,8 +901,14 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    weight_tiled: bool = False,
 ) -> torch.Tensor:
-    """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
+    """INT8 linear with dynamic row-wise activation quantization, on WMMA.
+
+    weight_tiled: weight bytes are in the big-tile GEMM's B order (see
+    TensorWiseINT8Layout.optimize_for_gemm); every M then runs the big-tile
+    kernel, which only writes bf16.
+    """
     x, input_act, act_weight = _split_input_act(
         x, input_act, input_act_weight, input_act_eps, convrot, convrot_groupsize)
     # k_act is the activated (quantized) row width: swiglu and situ halve the raw row.
@@ -925,7 +933,9 @@ def int8_linear(
     m = x2d.shape[0]
     k = k_act
     n = weight.shape[0]
-    tiled = _use_tiled_int8(m, n, k, x.device)
+    if weight_tiled and out_dtype != torch.bfloat16:
+        raise ValueError(f"tiled INT8 weights only support bf16 output, got {out_dtype}")
+    tiled = weight_tiled or _use_tiled_int8(m, n, k, x.device)
 
     # The WMMA K-step and the small-M GEMV both read a row 16 bytes at a time.
     if k % 16 != 0:
@@ -941,6 +951,8 @@ def int8_linear(
         if not _convrot_supported(
             k, convrot_groupsize, x.device, x.dtype, int8_global_spill=True
         ):
+            if weight_tiled:
+                raise ValueError(f"tiled INT8 weights need the fused ConvRot quantizer (K={k}, G={convrot_groupsize})")
             return _eager.int8_linear(
                 x2d.reshape(*orig_shape[:-1], x2d.shape[-1]),
                 weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
@@ -961,17 +973,25 @@ def int8_linear(
         bias = _bias_operand(bias, n, x.device)
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
-    gemm(
+    args = (
         _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
         0 if weight_scale.numel() == 1 else 1,
         None if bias is None else _dl(bias), m, n, k,
         DTYPE_TO_CODE[out_dtype], _stream(x),
     )
+    if tiled:
+        _C.int8_gemm_a_tiled128(*args, int(weight_tiled))
+    else:
+        _C.int8_gemm(*args)
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
     return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
+
+
+def int8_linear_tiled_weight(x, weight, weight_scale, bias=None, out_dtype=torch.bfloat16, **kwargs):
+    """int8_linear on a weight in the big-tile B order (TensorWiseINT8Layout.optimize_for_gemm)."""
+    return int8_linear(x, weight, weight_scale, bias, out_dtype, weight_tiled=True, **kwargs)
 
 
 def rms_gated_residual(
@@ -3034,6 +3054,14 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 "x": ParamConstraint(dtypes=floats, shape_rules=(DivisibleBy(-1, 16),)),
                 "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
                 "out_dtype": ParamConstraint(dtypes=out_floats),
+            },
+            default_devices=dev,
+        ),
+        "int8_linear_tiled_weight": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(DivisibleBy(-1, 16),)),
+                "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "out_dtype": ParamConstraint(dtypes=frozenset({torch.bfloat16})),
             },
             default_devices=dev,
         ),
